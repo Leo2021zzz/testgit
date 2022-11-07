@@ -1,2 +1,1 @@
-Git is a version control system.
-Git is free software.
+这是 LeoSu 用来测试学习 Git 与 Github 的仓库
