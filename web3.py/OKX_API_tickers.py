@@ -8,7 +8,7 @@ def get_single_tricker_data(symbol):
     """
 
     # 行情信息 API URL
-    ticker_url = f'https://www.okx.com/api/v5/market/ticker?instId={symbol}'
+    ticker_url = f'https://www.okx.com/api/v5/market/ticker?instId={symbol}-SWAP'
     response_object  = requests.get(ticker_url)
 
     json_object = response_object.json()
@@ -18,7 +18,7 @@ def get_single_tricker_data(symbol):
 
     ticker_df = pd.DataFrame(index=[0],columns=['datetime','symbol','last'])
     ticker_df['datetime'] = pd.to_datetime(datetime.utcnow())
-    ticker_df['symbol'] = symbol.replace('-','/').lower()
+    ticker_df['symbol'] = symbol.replace('-','/')
     ticker_df['last'] = raw_df['last']
 
     return ticker_df
@@ -41,12 +41,12 @@ def main():
     """
     # == 1.  获取交易对的ticker信息
     # == 1.1 单个交易对的ticker数据获取与处理
-    # symbol = 'BTC-USDT-SWAP'
+    # symbol = 'BTC-USDT'
     # tricker_df = get_single_tricker_data(symbol)
     # print(tricker_df)
 
     # ==1.2  多个交易对的ticker数据获取与处理
-    symbols = ['BTC-USDT-SWAP','ETH-USDT-SWAP','YGG-USDT-SWAP']
+    symbols = ['BTC-USDT','ETH-USDT','YGG-USDT']
     tickers_df = get_tickers_data(symbols)
     print(tickers_df)
 
