@@ -38,7 +38,7 @@ def get_tickers_data(symbols):
     多个交易对的ticker数据获取与处理
     """
 
-    # 自定义表格 tickers_df，使用循环将 ticker 添加到 trickers 中
+    # 自定义表格 tickers_df，使用循环将 ticker 添加到 tickers 中
     tickers_df = pd.DataFrame()
     for symbol in symbols:
         ticker_df = get_single_ticker_data(symbol)
