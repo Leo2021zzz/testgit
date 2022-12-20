@@ -3,15 +3,15 @@ import requests
 import pandas as pd
 from datetime import datetime
 
-def get_single_tricker_data(symbol):
+def get_single_ticker_data(symbol):
     """
     单个交易对的ticker数据获取
     """
 
     # 检查本地代理端口，默认1080
     proxy_pool = {
-	'http': 'http://127.0.0.1:10808',  
-	'https': 'https://127.0.0.1:10808',
+	'http': 'http://127.0.0.1:1080',  
+	'https': 'https://127.0.0.1:1080',
 }
     # 行情信息 API URL
     ticker_url = f'https://www.okx.com/api/v5/market/ticker?instId={symbol}-SWAP'
@@ -41,7 +41,7 @@ def get_tickers_data(symbols):
     # 自定义表格 tickers_df，使用循环将 ticker 添加到 trickers 中
     tickers_df = pd.DataFrame()
     for symbol in symbols:
-        ticker_df = get_single_tricker_data(symbol)
+        ticker_df = get_single_ticker_data(symbol)
         tickers_df = pd.concat([tickers_df,ticker_df])
 
     return tickers_df
@@ -54,8 +54,8 @@ def main():
 
     # == 1.1 单个交易对的ticker数据获取与处理
     # symbol = 'BTC-USDT'
-    # tricker_df = get_single_tricker_data(symbol)
-    # print(tricker_df)
+    # ticker_df = get_single_ticker_data(symbol)
+    # print(ticker_df)
 
     # ==1.2  多个交易对的ticker数据获取与处理
     symbols = ['BTC-USDT','ETH-USDT','YGG-USDT']
