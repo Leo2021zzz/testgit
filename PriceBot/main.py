@@ -19,7 +19,8 @@ def get_email_content():
 
 # 邮件信息
 sender_email = ''
-receiver_email = ''
+sender_name = '' ## 发件人昵称
+receiver_email = [] ## 收件人列表，实现一对多发送
 smtp_server = 'smtp.gmail.com'
 smtp_port = 587
 login = '@gmail.com'
@@ -37,6 +38,6 @@ interval = 600
 print("价格波动检测机器人开始运行...")
 while True:
     subject, body = get_email_content()
-    send_email_via_remote_socks5_proxy(sender_email, receiver_email, subject, body, smtp_server, smtp_port, login, password, proxy_address, proxy_port, proxy_username, proxy_password)
+    send_email_via_remote_socks5_proxy(sender_email, sender_name, receiver_email, subject, body, smtp_server, smtp_port, login, password, proxy_address, proxy_port, proxy_username, proxy_password)
     print(f"等待 {interval // 60} 分钟后发送下一封邮件...")
     time.sleep(interval)
