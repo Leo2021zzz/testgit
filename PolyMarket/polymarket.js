@@ -9,6 +9,16 @@
 // fix bug: 每次提交订单后，虽然订单成功了，但余额还没更新，代码以为失败了，继续重试，又提交了新订单。 解决方案：延长等待（7秒） + 实时查询持仓验证
 // update: 聪明钱包自动分行，不用;分隔
 // fix bug：重复下单是否是购买还是售出， 售出需要继续跟单操作  // 只要有售出 则将全部售出,不按比例
+// update: 更新传入参数 获取不同的数据   例如   task poly.js _1  则使用  _1组的数据 
+// update: 新增聪明钱包最小下单金额跟随 默认100    环境变量 添加例如： MIN_FOLLOW_AMOUNT  值 500   低于500的不跟随下注
+// update: 新增 检测到跟单钱包有 buy 另外一个 assets ，将这个市场下的全部资产售出
+
+//获取传入的参数
+const args = process.argv.slice(2); // 跳过前两个固定参数
+console.log('使用参数:', args[0]);
+var _NUM = ""
+if (args[0]) { _NUM = args[0] }
+
 
 import { ClobClient, OrderType, AssetType } from "@polymarket/clob-client";
 import { BuilderConfig } from "@polymarket/builder-signing-sdk";
@@ -27,16 +37,21 @@ const globalStats = {
 // ==================== 配置部分 ====================
 
 // 环境变量
-const SECRETKEY = process.env.SECRETKEY;  // 私钥
-const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS;  // polymarket地址
-const SMART_WALLET = process.env.SMART_WALLET;    // 聪明钱包 格式  0x....;0x....;0x....
-const FOLLOW_VALUE = parseFloat(process.env.FOLLOW_VALUE || "0.1");   // 跟单比例
-const CYCLE_INTERVAL_MS = process.env.CYCLE_INTERVAL_MS || 120000; // 2分钟循环间隔
+const SECRETKEY = getSecretKey(`SECRETKEY${_NUM}`);  // 私钥
+const FUNDER_ADDRESS = getSecretKey(`FUNDER_ADDRESS${_NUM}`);  // polymarket地址
+const SMART_WALLET = getSecretKey(`SMART_WALLET${_NUM}`);    // 聪明钱包 格式  0x....;0x....;0x....
+const FOLLOW_VALUE = parseFloat(getSecretKey(`FOLLOW_VALUE${_NUM}`) || 0.1);   // 跟单比例
+const CYCLE_INTERVAL_MS = getSecretKey(`CYCLE_INTERVAL_MS${_NUM}`) || 120000; // 2分钟循环间隔
 
 // https://polymarket.com/settings?tab=builder 中添加获取
-const POLY_BUILDER_API_KEY = process.env.POLY_BUILDER_API_KEY;
-const POLY_BUILDER_SECRET = process.env.POLY_BUILDER_SECRET;
-const POLY_BUILDER_PASSPHRASE = process.env.POLY_BUILDER_PASSPHRASE;
+const POLY_BUILDER_API_KEY = getSecretKey(`POLY_BUILDER_API_KEY${_NUM}`);
+const POLY_BUILDER_SECRET = getSecretKey(`POLY_BUILDER_SECRET${_NUM}`);
+const POLY_BUILDER_PASSPHRASE = getSecretKey(`POLY_BUILDER_PASSPHRASE${_NUM}`);
+
+const MIN_ORDER_AMOUNT = getSecretKey(`MIN_ORDER_AMOUNT${_NUM}`) || 1; // 最小订单金额
+const MAX_ORDER_AMOUNT = getSecretKey(`MAX_ORDER_AMOUNT${_NUM}`) || 2; // 最大订单金额
+const MIN_FOLLOW_AMOUNT = getSecretKey(`MIN_FOLLOW_AMOUNT${_NUM}`) || 100; // 聪明钱包最小跟随下注单金额
+
 
 // 配置常量
 const HOST = "https://clob.polymarket.com";
@@ -45,8 +60,7 @@ const CHAIN_ID = 137;
 const SIGNATURE_TYPE = 2;
 const MAX_RETRIES = 3;
 const SCAN_DELAY_MS = 2000;
-const MIN_ORDER_AMOUNT = process.env.MIN_ORDER_AMOUNT || "1"; // 最小订单金额
-const MAX_ORDER_AMOUNT = process.env.MAX_ORDER_AMOUNT || "2"; // 最大订单金额
+
 const MIN_AVAILABLE_BALANCE = 1; // 最小可用余额，低于此值不执行买入
 
 // 合约地址
@@ -54,6 +68,11 @@ const CTF_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
 const USDCe_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 // ==================== 工具函数 ====================
+
+//获取变量
+function getSecretKey(envVarName) {
+  return process.env[envVarName];
+}
 
 /**
  * 延迟函数
@@ -89,17 +108,17 @@ async function httpGet(url, config = {}, retryCount = 0) {
  */
 function validateEnvironmentVariables() {
   if (!SECRETKEY) {
-    console.error('错误：未设置私钥，请在环境变量中添加 SECRETKEY');
+    console.error('错误：未设置私钥，请在环境变量中添加 SECRETKEY' + _NUM);
     process.exit(1);
   }
 
   if (!FUNDER_ADDRESS) {
-    console.error('错误：未设置代理地址，请在环境变量中添加 FUNDER_ADDRESS');
+    console.error('错误：未设置代理地址，请在环境变量中添加 FUNDER_ADDRESS' + _NUM);
     process.exit(1);
   }
 
   if (!SMART_WALLET) {
-    console.error('错误：未设置聪明钱包地址，请在环境变量中添加 SMART_WALLET');
+    console.error('错误：未设置聪明钱包地址，请在环境变量中添加 SMART_WALLET' + _NUM);
     process.exit(1);
   }
 
@@ -200,12 +219,17 @@ async function executeFollowTrade(client, trade, market, availableBalance) {
     }
     // 计算跟单金额
     if (side === "BUY") {
+
+      if (usdcSize < MIN_FOLLOW_AMOUNT) {  //聪明钱包最小跟随金额
+        return { success: false, reason: `聪明钱包下单金额太小$${usdcSize}` };
+      }
+
       if (FOLLOW_VALUE == 0) {   //设置跟单随机
-        amount = (Math.random() * (MAX_ORDER_AMOUNT - MIN_ORDER_AMOUNT) + parseFloat(MIN_ORDER_AMOUNT)).toFixed(3);
+        amount = parseFloat((Math.random() * (MAX_ORDER_AMOUNT - MIN_ORDER_AMOUNT) + parseFloat(MIN_ORDER_AMOUNT)).toFixed(3));
       } else {   //按固定比例跟
         amount = parseFloat((usdcSize * FOLLOW_VALUE).toFixed(3));
-        console.log(`计划买入: $${amount}`);
       }
+      console.log(`计划买入: $${amount}`);
 
 
       // 检查可用余额是否足够
@@ -242,7 +266,7 @@ async function executeFollowTrade(client, trade, market, availableBalance) {
       });
 
       if (sell_balance.balance > 0) {
-        amount = (sell_balance.balance / 1000000).toFixed(3);   // 全部卖出持有的
+        amount =  Math.floor((sell_balance.balance / 1000000) * 100) / 100 ;   // 全部卖出持有的
       } else {
         console.log(`没有可卖出的资产`);
         return { success: false, reason: "没有可卖出的资产" };
@@ -253,13 +277,13 @@ async function executeFollowTrade(client, trade, market, availableBalance) {
 
     console.log(`执行交易: $${amount}`);
 
-    // 市价单 - FOK (全部成交或取消)
+    // 市价单 - FOK (全部成交或取消)  FAK 允许部分成交
     const response = await client.createAndPostMarketOrder(
       {
         tokenID: asset,
         amount: amount,
         side: side,
-        price: 0.99,
+        // price: 0.99,
       },
       {
         tickSize: market.minimum_tick_size || "0.01",
@@ -310,11 +334,18 @@ async function processWallet(client, walletAddress, cycleNumber) {
   );
 
   // 构建已持仓 conditionId 集合（只判断是否已有仓位）
-  const myPositionSet = new Set(
+  // const myPositionSet = new Set(
+  //   (myPositions || [])
+  //     .filter(p => Number(p.size) > 0)
+  //     .map(p => p.conditionId)
+  // );
+
+  const myPositionSet = new Map(
     (myPositions || [])
       .filter(p => Number(p.size) > 0)
-      .map(p => p.conditionId)
+      .map(p => [p.conditionId, p.asset])
   );
+
 
 
   if (availableBalance < MIN_AVAILABLE_BALANCE) {
@@ -329,7 +360,7 @@ async function processWallet(client, walletAddress, cycleNumber) {
   // 处理每笔交易
   for (let i = 0; i < trades.length; i++) {
     const trade = trades[i];
-
+    const trade_asset = trade.asset  // 成交前的实际资产
     try {
       // ⭐ 新增：忽略超过24小时的交易
       const tradeTime = trade.timestamp * 1000;
@@ -340,12 +371,6 @@ async function processWallet(client, walletAddress, cycleNumber) {
       if (hoursSinceTrade > 24) {
         const tradeDate = new Date(tradeTime).toLocaleString();
         console.log(`⏰ 跳过超过24小时的交易: ${tradeDate} | ${trade.market?.substring(0, 30) || '未知市场'}`);
-        continue;
-      }
-
-      // === 新增：如果自己已经有该市场持仓，直接跳过 ===    // 是否是购买
-      if (myPositionSet.has(trade.conditionId) && trade.side == "BUY") {
-        console.log(`⭐️ 已有持仓，跳过 market: ${trade.conditionId.substring(0, 8)}...`);
         continue;
       }
 
@@ -371,6 +396,22 @@ async function processWallet(client, walletAddress, cycleNumber) {
 
         continue;
       }
+
+
+      // === 新增：如果自己已经有该市场持仓，直接跳过 ===    // 是否是购买
+      if (trade.side == "BUY" && myPositionSet.has(trade.conditionId)) {  // 购买的情况下
+        if (myPositionSet.get(trade.conditionId) == trade.asset) {
+          console.log(`⭐️ 已有持仓，跳过 market: ${trade.conditionId.substring(0, 8)}...`);
+          continue;
+        } else {   //创建售出参数   全部售出
+          console.log(`原始数据${trade.conditionId}--${trade.asset}---${trade.outcome}`);
+          trade.side = "SELL"
+          trade.asset = myPositionSet.get(trade.conditionId) // 设置该市场下持有的仓位
+          console.log(`组装数据${trade.conditionId}--${trade.asset}`);
+        }
+      }
+
+
 
       // ===== 执行跟单（带重试机制）=====
       let orderSuccess = false;
@@ -433,6 +474,7 @@ async function processWallet(client, walletAddress, cycleNumber) {
           }
         } else {
           // 没有返回 orderID，可能是其他原因失败
+          finalResult = result
           console.log(`❌ 执行失败: ${result?.reason || '未知原因'}`);
           break; // 不再重试
         }
@@ -442,7 +484,7 @@ async function processWallet(client, walletAddress, cycleNumber) {
       if (orderSuccess && finalResult) {
         // 记录成功
         successCount++;
-        myPositionSet.add(trade.conditionId);
+        myPositionSet.set([trade.conditionId, trade_asset]);
 
         if (!globalStats.walletTrades[FUNDER_ADDRESS]) {
           globalStats.walletTrades[FUNDER_ADDRESS] = [];
@@ -894,6 +936,7 @@ async function mainLoop() {
   console.log(`🎯 跟单比例: ${FOLLOW_VALUE}`);
   console.log(`💰 最小订单金额: $${MIN_ORDER_AMOUNT}`);
   console.log(`💰 最大订单金额: $${MAX_ORDER_AMOUNT}`);
+  console.log(`💰 聪明钱包最小金额: $${MIN_FOLLOW_AMOUNT}`);
   console.log(`💰 最小余额要求: $${MIN_AVAILABLE_BALANCE}（低于此值将不执行买入）`);
   console.log(`⏱️  循环间隔: ${CYCLE_INTERVAL_MS / 1000} 秒`);
   console.log(`${'='.repeat(50)}\n`);
@@ -913,6 +956,7 @@ async function mainLoop() {
     cycleCount++;
 
     try {
+
       // 执行单次循环
       const result = await executeCycle(client, SMART_ADDRESSES, cycleCount);
 
