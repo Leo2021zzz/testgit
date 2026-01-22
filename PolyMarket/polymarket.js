@@ -11,7 +11,9 @@
 // fix bug：重复下单是否是购买还是售出， 售出需要继续跟单操作  // 只要有售出 则将全部售出,不按比例
 // update: 更新传入参数 获取不同的数据   例如   task poly.js _1  则使用  _1组的数据 
 // update: 新增聪明钱包最小下单金额跟随 默认100    环境变量 添加例如： MIN_FOLLOW_AMOUNT  值 500   低于500的不跟随下注
-// update: 新增 检测到跟单钱包有 buy 另外一个 assets ，将这个市场下的全部资产售出
+// update: 新增 检测到跟单钱包有 buy 另外一个 assets ，将这个市场下的 全部资产售出
+// fix bug：修复重复下单
+// update: 每次处理BUY交易前，会显示 "验证聪明钱包在该市场的持仓..."。如果检测到套利（≥持有2个方向），会显示 "聪明钱包套利，清仓退出";如果持有反方向，会显示 "我持有反方向，卖出规避风险！"
 
 //获取传入的参数
 const args = process.argv.slice(2); // 跳过前两个固定参数
@@ -266,7 +268,7 @@ async function executeFollowTrade(client, trade, market, availableBalance) {
       });
 
       if (sell_balance.balance > 0) {
-        amount =  Math.floor((sell_balance.balance / 1000000) * 100) / 100 ;   // 全部卖出持有的
+        amount = Math.floor((sell_balance.balance / 1000000) * 100) / 100;   // 全部卖出持有的
       } else {
         console.log(`没有可卖出的资产`);
         return { success: false, reason: "没有可卖出的资产" };
@@ -346,7 +348,7 @@ async function processWallet(client, walletAddress, cycleNumber) {
       .map(p => [p.conditionId, p.asset])
   );
 
-
+  console.log(myPositionSet);
 
   if (availableBalance < MIN_AVAILABLE_BALANCE) {
     console.log(`⚠️ 可用余额不足$${MIN_AVAILABLE_BALANCE}，跳过该钱包的所有交易`);
@@ -362,6 +364,48 @@ async function processWallet(client, walletAddress, cycleNumber) {
     const trade = trades[i];
     const trade_asset = trade.asset  // 成交前的实际资产
     try {
+
+      // 买入前检查聪明钱包是否套利
+    if (trade.side === "BUY") {
+      const smartWalletPositions = await httpGet(
+        `https://data-api.polymarket.com/positions?user=${walletAddress}`
+      );
+      
+      if (Array.isArray(smartWalletPositions)) {
+        const marketPositions = smartWalletPositions.filter(
+          p => p.conditionId === trade.conditionId && Number(p.size) > 0
+        );
+        
+        // 如果聪明钱包持有2个方向（套利）且我有持仓，清仓；我没持仓，则跳过不跟
+if (marketPositions.length >= 2) {
+  if (myPositionSet.has(trade.conditionId)) {
+    // 我有持仓，清仓
+    console.log(`⚠️ 聪明钱包套利（持有${marketPositions.length}个方向），清仓退出`);
+          
+          const market = await client.getMarket(trade.conditionId);
+          const sellTrade = {
+            asset: myPositionSet.get(trade.conditionId),
+            side: "SELL",
+            conditionId: trade.conditionId,
+            size: 999999
+          };
+          
+          await executeFollowTrade(client, sellTrade, market, currentBalance);
+          myPositionSet.delete(trade.conditionId);
+          await delay(7000);
+          currentBalance = await getAvailableBalance(client);
+          continue;
+        }
+        else {
+    // 我没持仓，跳过不跟
+    console.log(`⚠️ 聪明钱包套利（持有${marketPositions.length}个方向），跳过不跟`);
+    continue;
+  }
+}
+      }
+      
+      await delay(300);
+    }
       // ⭐ 新增：忽略超过24小时的交易
       const tradeTime = trade.timestamp * 1000;
       const currentTime = Date.now();
@@ -398,18 +442,37 @@ async function processWallet(client, walletAddress, cycleNumber) {
       }
 
 
-      // === 新增：如果自己已经有该市场持仓，直接跳过 ===    // 是否是购买
-      if (trade.side == "BUY" && myPositionSet.has(trade.conditionId)) {  // 购买的情况下
-        if (myPositionSet.get(trade.conditionId) == trade.asset) {
-          console.log(`⭐️ 已有持仓，跳过 market: ${trade.conditionId.substring(0, 8)}...`);
-          continue;
-        } else {   //创建售出参数   全部售出
-          console.log(`原始数据${trade.conditionId}--${trade.asset}---${trade.outcome}`);
-          trade.side = "SELL"
-          trade.asset = myPositionSet.get(trade.conditionId) // 设置该市场下持有的仓位
-          console.log(`组装数据${trade.conditionId}--${trade.asset}`);
-        }
-      }
+// 检查是否已有持仓
+if (trade.side == "BUY" && myPositionSet.has(trade.conditionId)) {
+  if (myPositionSet.get(trade.conditionId) == trade.asset) {
+    // 同方向，跳过
+    console.log(`⭐️ 已有持仓（同方向），跳过 market: ${trade.conditionId.substring(0, 8)}...`);
+    
+    if (!globalStats.walletFailedTrades[FUNDER_ADDRESS]) {
+      globalStats.walletFailedTrades[FUNDER_ADDRESS] = [];
+    }
+    globalStats.walletFailedTrades[FUNDER_ADDRESS].push({
+      tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
+      followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+      market: market.question || trade.market || market.description || '未知市场',
+      side: trade.side || 'UNKNOWN',
+      reason: '已有持仓（同方向）',
+      followedWallet: walletAddress
+    });
+    
+    continue;
+    
+  } else {
+    // 反方向，卖出规避风险
+    console.log(`⚠️ 我持有反方向，卖出规避风险！`);
+    console.log(`   聪明钱包持有: ${trade.asset.substring(0, 20)}...`);
+    console.log(`   我持有: ${myPositionSet.get(trade.conditionId).substring(0, 20)}...`);
+    console.log(`💰 执行卖出操作...`);
+    
+    trade.side = "SELL";
+    trade.asset = myPositionSet.get(trade.conditionId);
+  }
+}
 
 
 
@@ -484,8 +547,8 @@ async function processWallet(client, walletAddress, cycleNumber) {
       if (orderSuccess && finalResult) {
         // 记录成功
         successCount++;
-        myPositionSet.set([trade.conditionId, trade_asset]);
-
+        myPositionSet.set(trade.conditionId, trade_asset);
+        console.log(myPositionSet);
         if (!globalStats.walletTrades[FUNDER_ADDRESS]) {
           globalStats.walletTrades[FUNDER_ADDRESS] = [];
         }
