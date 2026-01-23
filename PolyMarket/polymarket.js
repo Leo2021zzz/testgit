@@ -14,6 +14,8 @@
 // update: 新增 检测到跟单钱包有 buy 另外一个 assets ，将这个市场下的 全部资产售出
 // fix bug：修复重复下单
 // update: 每次处理BUY交易前，会显示 "验证聪明钱包在该市场的持仓..."。如果检测到套利（≥持有2个方向），会显示 "聪明钱包套利，清仓退出";如果持有反方向，会显示 "我持有反方向，卖出规避风险！"
+// update: 日志中会正确显示 sell 原因：跟随聪明钱包卖出；和聪明钱包持有相反方向；聪明钱包在套利
+// update：领取奖金间隔24小时，避免 api 限额和日志爆炸
 
 //获取传入的参数
 const args = process.argv.slice(2); // 跳过前两个固定参数
@@ -394,6 +396,21 @@ if (marketPositions.length >= 2) {
           myPositionSet.delete(trade.conditionId);
           await delay(7000);
           currentBalance = await getAvailableBalance(client);
+              // ===== 新增：记录清仓操作 =====
+    if (!globalStats.walletTrades[FUNDER_ADDRESS]) {
+      globalStats.walletTrades[FUNDER_ADDRESS] = [];
+    }
+    
+    globalStats.walletTrades[FUNDER_ADDRESS].push({
+      tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
+      followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+      market: market.question || trade.market || market.description || '未知市场',
+      amount: 0,
+      side: 'SELL (套利清仓)',
+      followedWallet: walletAddress
+    });
+    
+    successCount++;
           continue;
         }
         else {
@@ -471,9 +488,14 @@ if (trade.side == "BUY" && myPositionSet.has(trade.conditionId)) {
     
     trade.side = "SELL";
     trade.asset = myPositionSet.get(trade.conditionId);
+    trade.sellType = "反向清仓";  // ← 新增注明 sell 原因
   }
 }
 
+// ===== 新增：标记跟随卖出 =====
+if (trade.side === "SELL" && !trade.sellType) {
+  trade.sellType = "跟随卖出";
+}
 
 
       // ===== 执行跟单（带重试机制）=====
@@ -558,7 +580,7 @@ if (trade.side == "BUY" && myPositionSet.has(trade.conditionId)) {
           followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
           market: market.question || trade.market || market.description || '未知市场',
           amount: finalResult.actualAmount || 0,
-          side: finalResult.actualSide || trade.side,
+          side: trade.sellType ? `SELL (${trade.sellType})` : (finalResult.actualSide || trade.side),
           followedWallet: walletAddress
         });
 
@@ -1008,6 +1030,8 @@ async function mainLoop() {
   let totalTradesProcessed = 0;
   let totalTradesSuccess = 0;
   let isRunning = true;
+  let lastRedeemTime = 0;  // ← 新增：上次领取时间（时间戳）
+
 
   // 设置优雅关闭处理器
   const shutdown = createShutdownHandler(cycleCount, totalTradesProcessed, totalTradesSuccess);
@@ -1027,8 +1051,25 @@ async function mainLoop() {
       totalTradesProcessed += result.totalProcessed;
       totalTradesSuccess += result.totalSuccess;
 
-      // 获取账户统计信息
-      await getAccountStats(client, claimClient);
+        // ===== 新增：按时间间隔领取奖金 =====
+      const REDEEM_INTERVAL_HOURS = 24;  // 每24小时领取一次
+      const currentTime = Date.now();
+      const timeSinceLastRedeem = currentTime - lastRedeemTime;
+      const redeemIntervalMs = REDEEM_INTERVAL_HOURS * 60 * 60 * 1000;
+      
+      if (timeSinceLastRedeem >= redeemIntervalMs || lastRedeemTime === 0) {
+        console.log(`\n🎁 距离上次领取已过 ${(timeSinceLastRedeem / 1000 / 60 / 60).toFixed(1)} 小时，执行领取奖金...`);
+        await getAccountStats(client, claimClient);
+        lastRedeemTime = currentTime;
+      } else {
+        // 只获取余额，不领取奖金
+        const availableBalance = await getAvailableBalance(client);
+        console.log(`\n💰 当前可用余额: $${availableBalance.toFixed(2)}`);
+        
+        const nextRedeemIn = (redeemIntervalMs - timeSinceLastRedeem) / 1000 / 60;
+        console.log(`⏰ 下次领取时间: ${Math.ceil(nextRedeemIn)} 分钟后`);
+      }
+      // ===== 修改结束 =====
 
       // 显示当前运行统计
       console.log(`\n📈 当前运行统计:`);
