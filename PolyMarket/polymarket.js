@@ -16,6 +16,15 @@
 // update: 每次处理BUY交易前，会显示 "验证聪明钱包在该市场的持仓..."。如果检测到套利（≥持有2个方向），会显示 "聪明钱包套利，清仓退出";如果持有反方向，会显示 "我持有反方向，卖出规避风险！"
 // update: 日志中会正确显示 sell 原因：跟随聪明钱包卖出；和聪明钱包持有相反方向；聪明钱包在套利
 // update：领取奖金间隔24小时，避免 api 限额和日志爆炸
+// update: Buy 类型下单，不再重试5次；3秒后检查状态，如果持仓和余额未变化，则输出结果变更为“状态未确认、手动查询”
+// fix: 卖出经常不成功，添加重试机制（重试5次，间隔1秒。 最后统一接收结果）
+// update: 当程序运行时（配置定时启动） 1. 限制买入次数  2. 仓位清仓后，程序关闭  3. 手动设置程序每日关闭时间
+// fix：状态未确定的单子，会最多循环扫描10次。 如果已成功，则状态会更新（记录买入成功的次数）；10次后还扫描不到该仓位，则判定为失败
+// update：买入时用三种方式查询是否成功：余额是否变化、仓位是否新增、Order ID 状态（新增）
+// fix : 买入时只用 order id 查询。 修复一些日志显示问题
+// update: 启用心跳日志。 
+// fix  领取时部分领取失败  、二元市场 正常，多元市场结果 未知
+// fix: 跟随卖出时，会先检查是否有该持仓。 没有持仓直接跳过，不在用空订单去访问 api ；优化下单失败的报错提示；买入2次并清仓后，程序现在会正确关闭； 修复买入时却提示余额不足的小概率事件，预留总资金的 3% 作为安全边际
 
 //获取传入的参数
 const args = process.argv.slice(2); // 跳过前两个固定参数
@@ -27,7 +36,7 @@ if (args[0]) { _NUM = args[0] }
 import { ClobClient, OrderType, AssetType } from "@polymarket/clob-client";
 import { BuilderConfig } from "@polymarket/builder-signing-sdk";
 import { RelayClient, RelayerTxType } from "@polymarket/builder-relayer-client";
-import { Wallet, providers } from "ethers";
+import { Wallet, providers,ethers } from "ethers";
 import axios from "axios";
 import moment from 'moment';
 import { encodeFunctionData } from "viem";
@@ -35,7 +44,10 @@ import { encodeFunctionData } from "viem";
 // ==================== 全局统计变量 ====================
 const globalStats = {
   walletTrades: {},      // 成功的跟单记录
-  walletFailedTrades: {} // 失败的跟单记录
+  walletFailedTrades: {},// 失败的跟单记录
+  totalBuyCount: 0,       // 总成功买入次数计数器
+  buyPositions: new Set(), // 记录买入的 conditionId
+  pendingVerification: []  // 待验证的未确定单子
 };
 
 // ==================== 配置部分 ====================
@@ -56,6 +68,13 @@ const MIN_ORDER_AMOUNT = getSecretKey(`MIN_ORDER_AMOUNT${_NUM}`) || 1; // 最小
 const MAX_ORDER_AMOUNT = getSecretKey(`MAX_ORDER_AMOUNT${_NUM}`) || 2; // 最大订单金额
 const MIN_FOLLOW_AMOUNT = getSecretKey(`MIN_FOLLOW_AMOUNT${_NUM}`) || 100; // 聪明钱包最小跟随下注单金额
 
+const MAX_BUY_COUNT = 2; // 最大买入次数限制，达到后只能卖出和领取
+// 设置程序自动关闭时间
+const AUTO_CLOSE_HOUR = 23;   // 自动关闭时间：小时（北京时间）
+const AUTO_CLOSE_MINUTE = 59; // 自动关闭时间：分钟（北京时间）
+// 心跳日志
+const HEARTBEAT_INTERVAL = 10; // 10次循环，心跳一次。 心跳：已运行 6 轮 | 成功 0 | BUY 0/2
+
 
 // 配置常量
 const HOST = "https://clob.polymarket.com";
@@ -70,6 +89,7 @@ const MIN_AVAILABLE_BALANCE = 1; // 最小可用余额，低于此值不执行�
 // 合约地址
 const CTF_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
 const USDCe_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+const NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
 
 // ==================== 工具函数 ====================
 
@@ -206,12 +226,59 @@ async function getMyHoldingConditionSet() {
 
 
 /**
- * 执行跟单交易
+ * 执行跟单交易、新增执行卖出操作（重试机制）
  * @param {Object} client - CLOB客户端
  * @param {Object} trade - 交易信息
  * @param {Object} market - 市场信息
  * @param {number} availableBalance - 可用余额
  */
+async function executeSellWithRetries(client, trade, market, availableBalance) {
+  const SELL_RETRY_COUNT = 5; // 卖出重试次数，修改这里即可
+
+  console.log(`🔄 开始卖出操作（${SELL_RETRY_COUNT}次重试机制）...`);
+
+  const promises = [];
+
+  // 连续发起N次卖出请求，每次间隔1秒
+  for (let i = 0; i < SELL_RETRY_COUNT; i++) {
+    if (i > 0) {
+      await delay(1000); // 等待1秒
+    }
+    console.log(`  📤 发起第 ${i + 1} 次卖出请求...`);
+    const promise = executeFollowTrade(client, trade, market, availableBalance);
+    promises.push(promise);
+  }
+
+  // 等待所有请求返回
+  console.log(`⏳ 等待所有卖出请求返回结果...`);
+  const results = await Promise.all(promises);
+
+  // 打印所有结果
+  console.log(`\n📊 卖出结果汇总：`);
+  let successCount = 0;
+  results.forEach((result, index) => {
+    if (result && result.orderID) {
+      console.log(`  ✅ 第 ${index + 1} 次: 成功 (OrderID: ${result.orderID})`);
+      successCount++;
+    } else {
+      // 简化失败原因显示
+      let reason = result?.reason || '未知原因';
+      if (reason.includes('not enough balance')) {
+        reason = '余额不足';
+      } else if (reason.includes('invalid amounts') || reason.includes('must be higher than 0')) {
+        reason = '金额无效';
+      }
+      console.log(`  ❌ 第 ${index + 1} 次: 失败 (${reason})`);
+    }
+  });
+
+  console.log(`📈 成功率: ${successCount}/${SELL_RETRY_COUNT}\n`);
+
+  // 只要有一次成功就返回成功结果
+  const successResult = results.find(r => r && r.orderID);
+  return successResult || results[0];
+}
+
 async function executeFollowTrade(client, trade, market, availableBalance) {
   try {
     const { asset, side, usdcSize, size } = trade;
@@ -256,11 +323,13 @@ async function executeFollowTrade(client, trade, market, availableBalance) {
         console.log(`跟单金额超过上限，调整为: $${amount}`);
       }
 
-      // 确保金额不超过可用余额
-      if (amount > availableBalance) {
-        amount = availableBalance;
-        console.log(`跟单金额超过可用余额，调整为: $${amount}`);
+      // 确保金额不超过可用余额，预留3%作为安全边距
+      const safeBalance = availableBalance * 0.97; // 只使用97%的可用余额
+      if (amount > safeBalance) {
+        amount = safeBalance;
+        console.log(`跟单金额调整为可用余额的97%: $${amount.toFixed(2)}`);
       }
+
 
     } else {
       //获取可卖出的 数量仓位 
@@ -287,6 +356,7 @@ async function executeFollowTrade(client, trade, market, availableBalance) {
         tokenID: asset,
         amount: amount,
         side: side,
+        price: side === "BUY" ? 0.99 : 0.01,  // BUY最高0.99，SELL最低0.01
         // price: 0.99,
       },
       {
@@ -304,7 +374,16 @@ async function executeFollowTrade(client, trade, market, availableBalance) {
 
     return response;
   } catch (error) {
-    console.error(`跟单执行失败:`, error.message);
+    // 隐藏常见的错误信息，只在非预期错误时显示
+    const errorMsg = error.message || '';
+    const isExpectedError = 
+      errorMsg.includes('not enough balance') || 
+      errorMsg.includes('invalid amounts') ||
+      errorMsg.includes('maker and taker amount must be higher than 0');
+    
+    if (!isExpectedError) {
+      console.error(`跟单执行失败:`, error.message);
+    }
     return { success: false, reason: `交易执行失败: ${error.message}` };
   }
 }
@@ -315,14 +394,130 @@ async function executeFollowTrade(client, trade, market, availableBalance) {
  * @param {string} walletAddress - 钱包地址
  * @param {number} cycleNumber - 当前循环次数
  */
+
+// 验证待确定的单子
+async function verifyPendingTrades(client, currentCycle) {
+  if (!globalStats.pendingVerification || globalStats.pendingVerification.length === 0) {
+    return;
+  }
+
+  console.log(`\n🔍 开始验证 ${globalStats.pendingVerification.length} 笔待确定单子...`);
+
+  for (let i = 0; i < globalStats.pendingVerification.length; i++) {
+    const record = globalStats.pendingVerification[i];
+    const cyclesPassed = currentCycle - record.cycleAdded;
+
+    // ===== 规则一：超过 10 轮，直接放弃 =====
+    if (cyclesPassed >= 10) {
+      console.log(
+        `❌ pending 超时（${cyclesPassed} 轮），判定失败: ${record.conditionId?.slice(0, 8)}...`
+      );
+
+      const failedList = globalStats.walletFailedTrades[FUNDER_ADDRESS];
+      if (Array.isArray(failedList)) {
+        const target = failedList.find(r => r.orderID === record.orderID);
+        if (target) {
+          target.reason = `超过 ${cyclesPassed} 轮未确认，判定失败`;
+        }
+      }
+
+      globalStats.pendingVerification.splice(i, 1);
+      i--;
+      continue;
+    }
+
+    // ===== 只查询一次订单状态 =====
+    let orderStatus;
+    try {
+      orderStatus = await client.getOrder(record.orderID);
+    } catch (error) {
+      console.log(`⚠️ 查询 pending 订单状态失败: ${error.message}`);
+      continue; // 本轮查不到，留到下一轮
+    }
+
+    // ===== 规则二：订单已取消 / 过期 → 失败 =====
+    if (orderStatus?.status === 'CANCELLED' || orderStatus?.status === 'EXPIRED') {
+      console.log(
+        `❌ 订单 ${orderStatus.status}，判定失败: ${record.conditionId?.slice(0, 8)}...`
+      );
+
+      const failedList = globalStats.walletFailedTrades[FUNDER_ADDRESS];
+      if (Array.isArray(failedList)) {
+        const target = failedList.find(r => r.orderID === record.orderID);
+        if (target) {
+          target.reason = `订单状态 ${orderStatus.status}`;
+        }
+      }
+
+      globalStats.pendingVerification.splice(i, 1);
+      i--;
+      continue;
+    }
+
+    // ===== 规则三：订单 MATCHED → 成功 =====
+    if (orderStatus?.status === 'MATCHED') {
+      console.log(
+        `✅ pending 单子确认成功（MATCHED）: ${record.conditionId?.slice(0, 8)}...`
+      );
+
+      // 从失败列表中移除
+      const failedList = globalStats.walletFailedTrades[FUNDER_ADDRESS];
+      if (Array.isArray(failedList)) {
+        const idx = failedList.findIndex(r => r.orderID === record.orderID);
+        if (idx !== -1) {
+          failedList.splice(idx, 1);
+        }
+      }
+
+      // 加入成功列表
+      if (!globalStats.walletTrades[FUNDER_ADDRESS]) {
+        globalStats.walletTrades[FUNDER_ADDRESS] = [];
+      }
+      globalStats.walletTrades[FUNDER_ADDRESS].push({
+        tradeTime: record.tradeTime,
+        followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+        market: record.market,
+        amount: record.amount,
+        side: 'BUY（pending 转正）',
+        followedWallet: record.followedWallet
+      });
+      // 成功后记录 BUY 次数
+      globalStats.totalBuyCount++;
+      globalStats.buyPositions.add(record.conditionId);
+
+
+      globalStats.pendingVerification.splice(i, 1);
+      i--;
+      continue;
+    }
+
+    // ===== 走到这里：订单仍然是 PENDING，什么都不做，等下一轮 =====
+  }
+}
+
+
+// async function processWallet(client, walletAddress, cycleNumber) {
+//   console.log(`\n[循环 ${cycleNumber}] 扫描钱包: ${walletAddress}`);
+//    const cycleCount = cycleNumber; 
+//   // const myHoldingConditions = await getMyHoldingConditionSet();
+
+//   // 获取最近交易
+//   const tradeMinutes = CYCLE_INTERVAL_MS / 1000 / 60;
+//   const trades = await getRecentTrades(walletAddress, tradeMinutes);
+//   console.log(`发现最近${tradeMinutes}分钟内的交易: ${trades.length} 笔`);
 async function processWallet(client, walletAddress, cycleNumber) {
-  console.log(`\n[循环 ${cycleNumber}] 扫描钱包: ${walletAddress}`);
+  const cycleCount = cycleNumber;
   // const myHoldingConditions = await getMyHoldingConditionSet();
 
   // 获取最近交易
   const tradeMinutes = CYCLE_INTERVAL_MS / 1000 / 60;
   const trades = await getRecentTrades(walletAddress, tradeMinutes);
-  console.log(`发现最近${tradeMinutes}分钟内的交易: ${trades.length} 笔`);
+
+  // ⭐ Step 3：只有发现交易才打印扫描日志
+  if (trades.length > 0) {
+    console.log(`\n[循环 ${cycleNumber}] 扫描钱包: ${walletAddress}`);
+    console.log(`发现最近${tradeMinutes}分钟内的交易: ${trades.length} 笔`);
+  }
 
   if (trades.length === 0) {
     return { wallet: walletAddress, processed: 0, success: 0 };
@@ -367,62 +562,105 @@ async function processWallet(client, walletAddress, cycleNumber) {
     const trade_asset = trade.asset  // 成交前的实际资产
     try {
 
-      // 买入前检查聪明钱包是否套利
-    if (trade.side === "BUY") {
-      const smartWalletPositions = await httpGet(
-        `https://data-api.polymarket.com/positions?user=${walletAddress}`
-      );
-      
-      if (Array.isArray(smartWalletPositions)) {
-        const marketPositions = smartWalletPositions.filter(
-          p => p.conditionId === trade.conditionId && Number(p.size) > 0
-        );
-        
-        // 如果聪明钱包持有2个方向（套利）且我有持仓，清仓；我没持仓，则跳过不跟
-if (marketPositions.length >= 2) {
-  if (myPositionSet.has(trade.conditionId)) {
-    // 我有持仓，清仓
-    console.log(`⚠️ 聪明钱包套利（持有${marketPositions.length}个方向），清仓退出`);
-          
-          const market = await client.getMarket(trade.conditionId);
-          const sellTrade = {
-            asset: myPositionSet.get(trade.conditionId),
-            side: "SELL",
-            conditionId: trade.conditionId,
-            size: 999999
-          };
-          
-          await executeFollowTrade(client, sellTrade, market, currentBalance);
-          myPositionSet.delete(trade.conditionId);
-          await delay(7000);
-          currentBalance = await getAvailableBalance(client);
-              // ===== 新增：记录清仓操作 =====
-    if (!globalStats.walletTrades[FUNDER_ADDRESS]) {
-      globalStats.walletTrades[FUNDER_ADDRESS] = [];
-    }
-    
-    globalStats.walletTrades[FUNDER_ADDRESS].push({
-      tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
-      followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
-      market: market.question || trade.market || market.description || '未知市场',
-      amount: 0,
-      side: 'SELL (套利清仓)',
-      followedWallet: walletAddress
-    });
-    
-    successCount++;
+      // 检查是否达到买入次数限制，检查聪明钱包是否套利
+      if (trade.side === "BUY") {
+        // 检查是否已达到最大买入次数
+        if (globalStats.totalBuyCount >= MAX_BUY_COUNT) {
+          console.log(`🚫 已达到最大买入次数限制(${MAX_BUY_COUNT}次)，跳过买入操作`);
+
+          if (!globalStats.walletFailedTrades[FUNDER_ADDRESS]) {
+            globalStats.walletFailedTrades[FUNDER_ADDRESS] = [];
+          }
+          globalStats.walletFailedTrades[FUNDER_ADDRESS].push({
+            tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
+            followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+            market: market?.question || trade.market || '未知市场',
+            side: 'BUY',
+            reason: `已达到买入次数上限(${MAX_BUY_COUNT}次)`,
+            followedWallet: walletAddress
+          });
+
           continue;
         }
-        else {
-    // 我没持仓，跳过不跟
-    console.log(`⚠️ 聪明钱包套利（持有${marketPositions.length}个方向），跳过不跟`);
-    continue;
-  }
-}
+        // 买入前检查聪明钱包是否套利
+        const smartWalletPositions = await httpGet(
+          `https://data-api.polymarket.com/positions?user=${walletAddress}`
+        );
+
+        if (Array.isArray(smartWalletPositions)) {
+          const marketPositions = smartWalletPositions.filter(
+            p => p.conditionId === trade.conditionId && Number(p.size) > 0
+          );
+
+          // 如果聪明钱包持有2个方向（套利）且我有持仓，清仓；我没持仓，则跳过不跟
+          // 我新增卖出重试机制
+          if (marketPositions.length >= 2) {
+            if (myPositionSet.has(trade.conditionId)) {
+              // 我有持仓，清仓
+              console.log(`⚠️ 聪明钱包套利（持有${marketPositions.length}个方向），清仓退出`);
+
+              const market = await client.getMarket(trade.conditionId);
+              const sellTrade = {
+                asset: myPositionSet.get(trade.conditionId),
+                side: "SELL",
+                conditionId: trade.conditionId,
+                size: 999999
+              };
+
+              // 使用新的卖出重试机制
+              const sellResult = await executeSellWithRetries(client, sellTrade, market, currentBalance);
+
+              // 等待7秒后检查结果
+              await delay(7000);
+              const newBalance = await getAvailableBalance(client);
+              const balanceChanged = Math.abs(newBalance - currentBalance) > 0.01;
+
+              // 判断是否成功
+              if (sellResult && sellResult.orderID && balanceChanged) {
+                console.log(`✅ 套利清仓成功！余额: $${currentBalance.toFixed(2)} → $${newBalance.toFixed(2)}`);
+                myPositionSet.delete(trade.conditionId);
+                currentBalance = newBalance;
+
+                if (!globalStats.walletTrades[FUNDER_ADDRESS]) {
+                  globalStats.walletTrades[FUNDER_ADDRESS] = [];
+                }
+                globalStats.walletTrades[FUNDER_ADDRESS].push({
+                  tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
+                  followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+                  market: market.question || trade.market || market.description || '未知市场',
+                  amount: sellResult.actualAmount || 0,
+                  side: 'SELL (套利清仓)',
+                  followedWallet: walletAddress
+                });
+                successCount++;
+              } else {
+                console.log(`❌ 套利清仓失败`);
+
+                if (!globalStats.walletFailedTrades[FUNDER_ADDRESS]) {
+                  globalStats.walletFailedTrades[FUNDER_ADDRESS] = [];
+                }
+                globalStats.walletFailedTrades[FUNDER_ADDRESS].push({
+                  tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
+                  followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+                  market: market.question || trade.market || market.description || '未知市场',
+                  side: 'SELL (套利清仓)',
+                  reason: sellResult?.reason || '卖出失败',
+                  followedWallet: walletAddress
+                });
+              }
+
+              continue;
+            }
+            else {
+              // 我没持仓，跳过不跟
+              console.log(`⚠️ 聪明钱包套利（持有${marketPositions.length}个方向），跳过不跟`);
+              continue;
+            }
+          }
+        }
+
+        await delay(300);
       }
-      
-      await delay(300);
-    }
       // ⭐ 新增：忽略超过24小时的交易
       const tradeTime = trade.timestamp * 1000;
       const currentTime = Date.now();
@@ -459,109 +697,250 @@ if (marketPositions.length >= 2) {
       }
 
 
-// 检查是否已有持仓
-if (trade.side == "BUY" && myPositionSet.has(trade.conditionId)) {
-  if (myPositionSet.get(trade.conditionId) == trade.asset) {
-    // 同方向，跳过
-    console.log(`⭐️ 已有持仓（同方向），跳过 market: ${trade.conditionId.substring(0, 8)}...`);
-    
-    if (!globalStats.walletFailedTrades[FUNDER_ADDRESS]) {
-      globalStats.walletFailedTrades[FUNDER_ADDRESS] = [];
-    }
-    globalStats.walletFailedTrades[FUNDER_ADDRESS].push({
-      tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
-      followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
-      market: market.question || trade.market || market.description || '未知市场',
-      side: trade.side || 'UNKNOWN',
-      reason: '已有持仓（同方向）',
-      followedWallet: walletAddress
-    });
-    
-    continue;
-    
-  } else {
-    // 反方向，卖出规避风险
-    console.log(`⚠️ 我持有反方向，卖出规避风险！`);
-    console.log(`   聪明钱包持有: ${trade.asset.substring(0, 20)}...`);
-    console.log(`   我持有: ${myPositionSet.get(trade.conditionId).substring(0, 20)}...`);
-    console.log(`💰 执行卖出操作...`);
-    
-    trade.side = "SELL";
-    trade.asset = myPositionSet.get(trade.conditionId);
-    trade.sellType = "反向清仓";  // ← 新增注明 sell 原因
-  }
-}
+      // 检查是否已有持仓
+      if (trade.side == "BUY" && myPositionSet.has(trade.conditionId)) {
+        if (myPositionSet.get(trade.conditionId) == trade.asset) {
+          // 同方向，跳过
+          console.log(`⭐️ 已有持仓（同方向），跳过 market: ${trade.conditionId.substring(0, 8)}...`);
 
-// ===== 新增：标记跟随卖出 =====
-if (trade.side === "SELL" && !trade.sellType) {
-  trade.sellType = "跟随卖出";
-}
+          if (!globalStats.walletFailedTrades[FUNDER_ADDRESS]) {
+            globalStats.walletFailedTrades[FUNDER_ADDRESS] = [];
+          }
+          globalStats.walletFailedTrades[FUNDER_ADDRESS].push({
+            tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
+            followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+            market: market.question || trade.market || market.description || '未知市场',
+            side: trade.side || 'UNKNOWN',
+            reason: '已有持仓（同方向）',
+            followedWallet: walletAddress
+          });
 
+          continue;
 
-      // ===== 执行跟单（带重试机制）=====
-      let orderSuccess = false;
-      let finalResult = null;
-      const MAX_RETRIES = 5;
+        } else {
+          // 反方向，卖出规避风险
+          console.log(`⚠️ 我持有反方向，卖出规避风险！`);
+          console.log(`   聪明钱包持有: ${trade.asset.substring(0, 20)}...`);
+          console.log(`   我持有: ${myPositionSet.get(trade.conditionId).substring(0, 20)}...`);
+          console.log(`💰 执行卖出操作...`);
 
-      for (let retry = 0; retry < MAX_RETRIES; retry++) {
-        if (retry > 0) {
-          console.log(`🔄 第 ${retry} 次重试...`);
-          await delay(1000); // 重试前等待1秒
-        }
+          const sellTrade = {
+            asset: myPositionSet.get(trade.conditionId),
+            side: "SELL",
+            conditionId: trade.conditionId,
+            size: 999999
+          };
 
-        // 执行跟单
-        const result = await executeFollowTrade(client, trade, market, currentBalance);
+          // 使用新的卖出重试机制
+          const sellResult = await executeSellWithRetries(client, sellTrade, market, currentBalance);
 
-        if (result && result.orderID) {
-          console.log(`📝 获得 Order ID: ${result.orderID}`);
-
-          // 等待交易确认（延长到7秒）
-          console.log(`⏳ 等待 7 秒让交易确认...`);
+          // 等待7秒后检查结果
           await delay(7000);
-
-          // 验证余额是否真的变化了
           const newBalance = await getAvailableBalance(client);
-          console.log(`💰 余额检查: 之前 $${currentBalance.toFixed(2)}, 现在 $${newBalance.toFixed(2)}`);
           const balanceChanged = Math.abs(newBalance - currentBalance) > 0.01;
 
-          // 实时查询持仓，检查是否已经有这个市场的持仓了
-          let hasPosition = false;
-          try {
-            const currentPositions = await httpGet(
-              `https://data-api.polymarket.com/positions?user=${FUNDER_ADDRESS}`
-            );
-            if (Array.isArray(currentPositions)) {
-              hasPosition = currentPositions.some(
-                p => p.conditionId === trade.conditionId && Number(p.size) > 0
-              );
-              if (hasPosition) {
-                console.log(`✅ 检测到已有持仓，订单已成交`);
-              }
+          // 判断是否成功
+          if (sellResult && sellResult.orderID && balanceChanged) {
+            console.log(`✅ 反向清仓成功！余额: $${currentBalance.toFixed(2)} → $${newBalance.toFixed(2)}`);
+            myPositionSet.delete(trade.conditionId);
+            currentBalance = newBalance;
+
+            if (!globalStats.walletTrades[FUNDER_ADDRESS]) {
+              globalStats.walletTrades[FUNDER_ADDRESS] = [];
             }
-          } catch (error) {
-            console.log(`⚠️  查询持仓失败: ${error.message}`);
+            globalStats.walletTrades[FUNDER_ADDRESS].push({
+              tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
+              followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+              market: market.question || trade.market || market.description || '未知市场',
+              amount: sellResult.actualAmount || 0,
+              side: 'SELL (反向清仓)',
+              followedWallet: walletAddress
+            });
+            successCount++;
+          } else {
+            console.log(`❌ 反向清仓失败`);
+
+            if (!globalStats.walletFailedTrades[FUNDER_ADDRESS]) {
+              globalStats.walletFailedTrades[FUNDER_ADDRESS] = [];
+            }
+            globalStats.walletFailedTrades[FUNDER_ADDRESS].push({
+              tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
+              followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+              market: market.question || trade.market || market.description || '未知市场',
+              side: 'SELL (反向清仓)',
+              reason: sellResult?.reason || '卖出失败',
+              followedWallet: walletAddress
+            });
           }
 
-          // 余额变化 或 已有持仓，都算成功
-          if (balanceChanged || hasPosition) {
-            // 余额变化了，交易真的成功了
-            console.log(`✅ 跟单成功! 余额: $${currentBalance.toFixed(2)} → $${newBalance.toFixed(2)}`);
-            orderSuccess = true;
-            finalResult = result;
-            currentBalance = newBalance; // 更新当前余额
-            break; // 跳出重试循环
+          continue;
+        }
+      }
+
+
+      // ===== 执行跟单 =====
+      let orderSuccess = false;
+      let finalResult = null;
+      const MAX_RETRIES = 1;// 最大买入次数（1为不重试）
+
+      // 如果是卖出操作，使用新的重试机制
+      if (trade.side === "SELL") {
+        // 检查是否还有持仓，避免重复卖出
+        const sellBalance = await client.getBalanceAllowance({
+          asset_type: AssetType.CONDITIONAL,
+          token_id: trade.asset
+        });
+        
+        if (sellBalance.balance <= 0) {
+          console.log(`⏭️ 跳过卖出：该资产已无持仓 (${trade.asset.substring(0, 20)}...)`);
+          continue; // 跳过这笔交易，处理下一笔
+        }
+        
+        console.log(`💰 执行跟随卖出操作...`);
+        trade.sellType = "跟随卖出";  // 标记跟随卖出 
+
+        const sellResult = await executeSellWithRetries(client, trade, market, currentBalance);
+
+        // 等待7秒后检查结果
+        await delay(7000);
+        const newBalance = await getAvailableBalance(client);
+        const balanceChanged = Math.abs(newBalance - currentBalance) > 0.01;
+
+        // 只要有orderID就认为是成功的（5次中有1次成功）
+        if (sellResult && sellResult.orderID) {
+          if (balanceChanged) {
+            console.log(`✅ 跟随卖出成功！余额: $${currentBalance.toFixed(2)} → $${newBalance.toFixed(2)}`);
           } else {
-            // 余额没变，订单被取消了
-            console.log(`❌ 订单未成交，余额未变: $${newBalance.toFixed(2)}`);
-            if (retry === MAX_RETRIES - 1) {
-              console.log(`❌ 已重试 ${MAX_RETRIES} 次，放弃跟单`);
-            }
+            console.log(`✅ 跟随卖出成功！(余额未立即变化，可能延迟更新)`);
           }
+          orderSuccess = true;
+          finalResult = sellResult;
+          currentBalance = newBalance;
+          myPositionSet.delete(trade.conditionId);
         } else {
-          // 没有返回 orderID，可能是其他原因失败
-          finalResult = result
-          console.log(`❌ 执行失败: ${result?.reason || '未知原因'}`);
-          break; // 不再重试
+          console.log(`❌ 跟随卖出失败`);
+          finalResult = sellResult || { success: false, reason: '卖出失败' };
+        }
+
+      } else {
+
+        for (let retry = 0; retry < MAX_RETRIES; retry++) {
+          if (retry > 0) {
+            console.log(`🔄 第 ${retry} 次重试...`);
+            await delay(1000);
+          }
+
+          const result = await executeFollowTrade(client, trade, market, currentBalance);
+
+          // ===== 补丁：金额太小，立刻跳过（一定要在最前面）=====
+          if (
+            result?.success === false &&
+            result?.reason &&
+            result.reason.includes('聪明钱包下单金额太小')
+          ) {
+            console.log(`⏭️ 跳过该交易（原因：${result.reason}）`);
+
+            if (!globalStats.walletFailedTrades[FUNDER_ADDRESS]) {
+              globalStats.walletFailedTrades[FUNDER_ADDRESS] = [];
+            }
+
+            globalStats.walletFailedTrades[FUNDER_ADDRESS].push({
+              tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
+              followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+              market: market.question || trade.market || '未知市场',
+              side: 'BUY',
+              reason: result.reason,
+              followedWallet: walletAddress,
+              cycleAdded: cycleNumber
+            });
+
+            continue; // ⭐ 关键：直接处理下一笔 trade
+          }
+          // ===== 补丁结束 =====
+
+          if (result && result.orderID) {
+            console.log(`📝 获得 Order ID: ${result.orderID}`);
+
+            console.log(`⏳ 等待 7 秒让交易确认...`);
+            await delay(7000);
+
+            const newBalance = await getAvailableBalance(client);
+            console.log(`💰 余额检查: 之前 $${currentBalance.toFixed(2)}, 现在 $${newBalance.toFixed(2)}`);
+            const balanceChanged = Math.abs(newBalance - currentBalance) > 0.01;
+
+            let hasPosition = false;
+            try {
+              const currentPositions = await httpGet(
+                `https://data-api.polymarket.com/positions?user=${FUNDER_ADDRESS}`
+              );
+              if (Array.isArray(currentPositions)) {
+                hasPosition = currentPositions.some(
+                  p => p.conditionId === trade.conditionId && Number(p.size) > 0
+                );
+                if (hasPosition) {
+                  console.log(`✅ 检测到已有持仓，订单已成交`);
+                }
+              }
+            } catch (error) {
+              console.log(`⚠️  查询持仓失败: ${error.message}`);
+            }
+
+            // 新增：通过OrderID验证订单状态
+            let orderMatched = false;
+            try {
+              const orderStatus = await client.getOrder(result.orderID);
+              if (orderStatus && orderStatus.status === 'MATCHED') {
+                console.log(`✅ 订单状态已确认: MATCHED`);
+                orderMatched = true;
+              } else if (orderStatus && orderStatus.status) {
+                console.log(`⚠️ 订单状态: ${orderStatus.status}`);
+              }
+            } catch (error) {
+              console.log(`⚠️ 查询订单状态失败: ${error.message}`);
+            }
+            // ✅ 只要 MATCHED，立刻成功（最高优先级）
+            if (orderMatched) {
+              console.log(`✅ 跟单成功（以订单状态 MATCHED 为准）`);
+              orderSuccess = true;
+              finalResult = result;
+              currentBalance = newBalance;
+              break;
+            }
+
+            // ⏳ 未 MATCHED：不在这里判失败，进入 pending
+            console.log(`⏳ 订单未在 7 秒内确认，进入 pending 验证`);
+
+            const pendingRecord = {
+              tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
+              followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
+              market: market.question || trade.market || '未知市场',
+              side: trade.side || 'BUY',
+              reason: '状态未确定，请手动查询',
+              followedWallet: walletAddress,
+              conditionId: trade.conditionId,
+              asset: trade.asset,
+              cycleAdded: cycleNumber,
+              orderID: result.orderID,
+              amount: result.actualAmount || 0
+            };
+
+            if (!globalStats.walletFailedTrades[FUNDER_ADDRESS]) {
+              globalStats.walletFailedTrades[FUNDER_ADDRESS] = [];
+            }
+            // 等 verifyPendingTrades 最终判定
+            // 成功 → 加入成功统计,失败 → 再写入 walletFailedTrades
+            //globalStats.walletFailedTrades[FUNDER_ADDRESS].push(pendingRecord);
+
+            globalStats.pendingVerification.push(pendingRecord);
+            break;
+
+
+
+          } else {
+            finalResult = result
+            console.log(`❌ 执行失败: ${result?.reason || '未知原因'}`);
+            break;
+          }
         }
       }
 
@@ -584,6 +963,13 @@ if (trade.side === "SELL" && !trade.sellType) {
           followedWallet: walletAddress
         });
 
+        // 如果是买入操作，增加买入计数并记录 conditionId
+        if (finalResult.actualSide === 'BUY' && !trade.sellType) {
+          globalStats.totalBuyCount++;
+          globalStats.buyPositions.add(trade.conditionId);
+          console.log(`📊 当前累计买入次数: ${globalStats.totalBuyCount}/${MAX_BUY_COUNT}`);
+        }
+
         // 检查余额是否足够继续
         if (currentBalance < MIN_AVAILABLE_BALANCE) {
           console.log(`余额不足$${MIN_AVAILABLE_BALANCE},停止处理该钱包的后续交易`);
@@ -595,20 +981,36 @@ if (trade.side === "SELL" && !trade.sellType) {
           globalStats.walletFailedTrades[FUNDER_ADDRESS] = [];
         }
 
-        let failReason = 'FOK订单重试5次后仍未成交';
-        if (finalResult && finalResult.success === false) {
-          failReason = finalResult.reason;
-        }
-
-        globalStats.walletFailedTrades[FUNDER_ADDRESS].push({
+        const failedRecord = {
           tradeTime: moment(trade.timestamp * 1000).format('YYYY-MM-DD HH:mm:ss'),
           followTime: moment().format('YYYY-MM-DD HH:mm:ss'),
-          market: market.question || trade.market || market.description || '未知市场',
+          market: market.question || trade.market || '未知市场',
           side: trade.side || 'UNKNOWN',
-          reason: failReason,
-          followedWallet: walletAddress
-        });
+          reason: finalResult?.reason || '执行失败',
+          followedWallet: walletAddress,
+          conditionId: trade.conditionId,
+          asset: trade.asset,
+          cycleAdded: cycleNumber,
+          orderID: finalResult?.orderID || null,
+          amount: finalResult?.actualAmount || 0
+        };
+
+        globalStats.walletFailedTrades[FUNDER_ADDRESS].push(failedRecord);
+
+
+
+        // 只有“真的不确定”的单子才进 pending
+        const shouldPending =
+          failedRecord.orderID &&
+          !orderSuccess &&
+          failedRecord.reason === '状态未确定，请手动查询';
+
+        if (shouldPending) {
+          globalStats.pendingVerification.push(failedRecord);
+          console.log(`⏳ 加入 pending 验证队列（conditionId: ${failedRecord.conditionId?.slice(0, 8)}...)`);
+        }
       }
+
 
       // 交易间短暂延迟
       if (i < trades.length - 1) {
@@ -629,30 +1031,63 @@ if (trade.side === "SELL" && !trade.sellType) {
  * @param {Object} position - 持仓信息
  */
 function createRedeemTransaction(position) {
-  return {
-    to: CTF_ADDRESS,
-    data: encodeFunctionData({
-      abi: [{
-        name: "redeemPositions",
-        type: "function",
-        inputs: [
-          { name: "collateralToken", type: "address" },
-          { name: "parentCollectionId", type: "bytes32" },
-          { name: "conditionId", type: "bytes32" },
-          { name: "indexSets", type: "uint256[]" }
-        ],
-        outputs: []
-      }],
-      functionName: "redeemPositions",
-      args: [
-        USDCe_ADDRESS,
-        "0x0000000000000000000000000000000000000000000000000000000000000000",
-        position.conditionId,
-        [1, 2]  // YES 和 NO
-      ]
-    }),
-    value: "0"
-  };
+
+  if (position.negativeRisk) {   // 负风险市场赎回
+    console.error("负风险市场赎回");
+    let amounts
+    if (position.outcomeIndex == 0) {
+      amounts = [ethers.parseUnits(position.size, 6), 0];
+    } else {
+      amounts = [0, ethers.parseUnits(position.size, 6)];
+    }
+    return {
+      to: NEG_RISK_ADAPTER,
+      data: encodeFunctionData({
+        abi: [{
+          "name": "redeemPositions",
+          "type": "function",
+          "inputs": [
+            { "name": "conditionId", "type": "bytes32" },
+            { "name": "amounts", "type": "uint256[]" }
+          ],
+          "outputs": []
+        }],
+        functionName: "redeemPositions",
+        args: [position.conditionId, amounts]
+      }),
+      value: "0"
+    };
+
+  } else {    //// 标准 CTF 市场赎回
+    return {
+      to: CTF_ADDRESS,
+      data: encodeFunctionData({
+        abi: [{
+          name: "redeemPositions",
+          type: "function",
+          inputs: [
+            { name: "collateralToken", type: "address" },
+            { name: "parentCollectionId", type: "bytes32" },
+            { name: "conditionId", type: "bytes32" },
+            { name: "indexSets", type: "uint256[]" }
+          ],
+          outputs: []
+        }],
+        functionName: "redeemPositions",
+        args: [
+          USDCe_ADDRESS,
+          "0x0000000000000000000000000000000000000000000000000000000000000000",
+          position.conditionId,
+          [1, 2]  // YES 和 NO
+        ]
+      }),
+      value: "0"
+    };
+  }
+
+
+
+
 }
 
 /**
@@ -856,91 +1291,100 @@ async function executeCycle(client, smartAddresses, cycleNumber) {
   const totalProcessed = results.reduce((sum, r) => sum + r.processed, 0);
   const totalSuccess = results.reduce((sum, r) => sum + r.success, 0);
   const elapsedTime = Date.now() - startTime;
+  const shouldPrintDetail = totalProcessed > 0 || totalSuccess > 0;
 
-  console.log(`\n📊 [循环 ${cycleNumber}] 扫描完成`);
-  console.log(`⏱️  耗时: ${(elapsedTime / 1000).toFixed(2)} 秒`);
-  console.log(`🔍 扫描钱包: ${smartAddresses.length} 个`);
-  console.log(`📈 发现交易: ${totalProcessed} 笔`);
-  console.log(`✅ 成功跟单: ${totalSuccess} 笔`);
+  if (shouldPrintDetail) {
 
-  if (totalProcessed > 0) {
-    const successRate = (totalSuccess / totalProcessed) * 100;
-    console.log(`🎯 成功率: ${successRate.toFixed(1)}%`);
+    console.log(`\n📊 [循环 ${cycleNumber}] 扫描完成`);
+    console.log(`⏱️  耗时: ${(elapsedTime / 1000).toFixed(2)} 秒`);
+    console.log(`🔍 扫描钱包: ${smartAddresses.length} 个`);
+    console.log(`📈 发现交易: ${totalProcessed} 笔`);
+    console.log(`✅ 成功跟单: ${totalSuccess} 笔`);
 
-    // 显示成功率评级
-    if (successRate >= 80) {
-      console.log(`🌟 表现优秀!`);
-    } else if (successRate >= 50) {
-      console.log(`👍 表现良好`);
-    } else {
-      console.log(`⚠️  成功率偏低，请检查`);
+    if (totalProcessed > 0) {
+      const successRate = (totalSuccess / totalProcessed) * 100;
+      console.log(`🎯 成功率: ${successRate.toFixed(1)}%`);
+
+      if (successRate >= 80) {
+        console.log(`🌟 表现优秀!`);
+      } else if (successRate >= 50) {
+        console.log(`👍 表现良好`);
+      } else {
+        console.log(`⚠️  成功率偏低，请检查`);
+      }
     }
-  }
 
-  // 显示各个钱包的详细结果
-  console.log(`\n📋 各钱包跟单详情:`);
-  results.forEach((result, index) => {
-    const walletShort = result.wallet.substring(0, 6) + '...' + result.wallet.substring(38);
-    console.log(`  ${index + 1}. ${walletShort}: ${result.success}/${result.processed}`);
-  });
-
-  // 显示累计跟单统计
-  console.log(`\n📊 累计跟单详细统计:`);
-  console.log(`${'='.repeat(50)}`);
-
-  // 获取所有钱包地址（成功或失败都算）
-  const allWallets = new Set([
-    ...Object.keys(globalStats.walletTrades),
-    ...Object.keys(globalStats.walletFailedTrades)
-  ]);
-
-  if (allWallets.size === 0) {
-    console.log(`  暂无跟单记录`);
-  } else {
-    Array.from(allWallets).forEach((wallet, index) => {
-      const successTrades = globalStats.walletTrades[wallet] || [];
-      const failedTrades = globalStats.walletFailedTrades[wallet] || [];
-      const totalAmount = successTrades.reduce((sum, t) => sum + parseFloat(t.amount), 0);
-
-      console.log(`\n${index + 1}. 钱包: ${wallet}`);
-
-      // 显示成功跟单
-      if (successTrades.length > 0) {
-        console.log(`   ✅ 成功跟单: ${successTrades.length} 笔`);
-        console.log(`   💰 总金额: $${totalAmount.toFixed(2)}`);
-        console.log(`   详细记录:`);
-
-        successTrades.forEach((trade, idx) => {
-          const followedWalletInfo = trade.followedWallet ? `| 跟随: ${trade.followedWallet}` : '';
-          console.log(`      ${idx + 1}) 交易时间: ${trade.tradeTime} | 跟单时间: ${trade.followTime} | ${trade.side} | $${parseFloat(trade.amount).toFixed(2)} | ${trade.market} ${followedWalletInfo}`);
-        });
-      }
-
-      // 显示失败跟单
-      if (failedTrades.length > 0) {
-        console.log(`\n   ❌ 失败跟单: ${failedTrades.length} 笔`);
-        console.log(`   失败详情:`);
-
-        failedTrades.forEach((trade, idx) => {
-          const followedWalletInfo = trade.followedWallet ? `| 跟随: ${trade.followedWallet}` : '';
-          console.log(`      ${idx + 1}) 交易时间: ${trade.tradeTime} | 跟单时间: ${trade.followTime} | ${trade.side} | ${trade.market} | 原因: ${trade.reason} ${followedWalletInfo}`);
-        });
-      }
+    // 📋 各钱包跟单详情
+    console.log(`\n📋 各钱包跟单详情:`);
+    results.forEach((result, index) => {
+      const walletShort =
+        result.wallet.substring(0, 6) + '...' + result.wallet.substring(38);
+      console.log(
+        `  ${index + 1}. ${walletShort}: ${result.success}/${result.processed}`
+      );
     });
+
+    // 📊 累计跟单详细统计
+    console.log(`\n📊 累计跟单详细统计:`);
+    console.log(`${'='.repeat(50)}`);
+
+    const allWallets = new Set([
+      ...Object.keys(globalStats.walletTrades),
+      ...Object.keys(globalStats.walletFailedTrades)
+    ]);
+
+    if (allWallets.size === 0) {
+      console.log(`  暂无跟单记录`);
+    } else {
+      Array.from(allWallets).forEach((wallet, index) => {
+        const successTrades = globalStats.walletTrades[wallet] || [];
+        const failedTrades = globalStats.walletFailedTrades[wallet] || [];
+        const totalAmount = successTrades.reduce(
+          (sum, t) => sum + parseFloat(t.amount),
+          0
+        );
+
+        console.log(`\n${index + 1}. 钱包: ${wallet}`);
+
+        // 显示成功跟单
+        if (successTrades.length > 0) {
+          console.log(`   ✅ 成功跟单: ${successTrades.length} 笔`);
+          console.log(`   💰 总金额: $${totalAmount.toFixed(2)}`);
+          console.log(`   详细记录:`);
+
+          successTrades.forEach((trade, idx) => {
+            const followedWalletInfo = trade.followedWallet ? `| 跟随: ${trade.followedWallet}` : '';
+            console.log(`      ${idx + 1}) 交易时间: ${trade.tradeTime} | 跟单时间: ${trade.followTime} | ${trade.side} | $${parseFloat(trade.amount).toFixed(2)} | ${trade.market} ${followedWalletInfo}`);
+          });
+        }
+
+        // 显示失败跟单
+        if (failedTrades.length > 0) {
+          console.log(`\n   ❌ 失败跟单: ${failedTrades.length} 笔`);
+          console.log(`   失败详情:`);
+
+          failedTrades.forEach((trade, idx) => {
+            const followedWalletInfo = trade.followedWallet ? `| 跟随: ${trade.followedWallet}` : '';
+            console.log(`      ${idx + 1}) 交易时间: ${trade.tradeTime} | 跟单时间: ${trade.followTime} | ${trade.side} | ${trade.market} | 原因: ${trade.reason} ${followedWalletInfo}`);
+          });
+        }
+      });
+    }
+
+    console.log(`\n${'='.repeat(50)}`);
   }
 
-  console.log(`\n${'='.repeat(50)}`);
+  // 验证待确定的单子
+  await verifyPendingTrades(client, cycleNumber);
 
   return { cycleNumber, totalProcessed, totalSuccess, elapsedTime, results };
 }
 
 /**
  * 优雅关闭处理器
- * @param {number} cycleCount - 循环次数
- * @param {number} totalTradesProcessed - 总处理交易数
- * @param {number} totalTradesSuccess - 总成功交易数
+ * @param {Object} stats - 统计数据对象（引用传递，可以获取最新值）
  */
-function createShutdownHandler(cycleCount, totalTradesProcessed, totalTradesSuccess) {
+function createShutdownHandler(stats) {
   return async () => {
     console.log('\n🛑 收到关闭信号，正在停止程序...');
 
@@ -948,11 +1392,12 @@ function createShutdownHandler(cycleCount, totalTradesProcessed, totalTradesSucc
     console.log(`\n${'='.repeat(50)}`);
     console.log('📊 程序运行总统计');
     console.log(`${'='.repeat(50)}`);
-    console.log(`总循环次数: ${cycleCount}`);
-    console.log(`总处理交易: ${totalTradesProcessed}`);
-    console.log(`总成功跟单: ${totalTradesSuccess}`);
-    if (totalTradesProcessed > 0) {
-      console.log(`总成功率: ${((totalTradesSuccess / totalTradesProcessed) * 100).toFixed(1)}%`);
+    console.log(`总循环次数: ${stats.cycleCount}`);
+    console.log(`总处理交易: ${stats.totalTradesProcessed}`);
+    console.log(`总成功跟单: ${stats.totalTradesSuccess}`);
+    if (stats.totalTradesProcessed > 0) {
+      const rate = (stats.totalTradesSuccess / stats.totalTradesProcessed) * 100;
+      console.log(`成功率: ${rate.toFixed(1)}%`);
     }
     console.log(`📅 ${moment().format('YYYY-MM-DD HH:mm:ss')}`);
     console.log(`${'='.repeat(50)}`);
@@ -1026,72 +1471,168 @@ async function mainLoop() {
   console.log(`⏱️  循环间隔: ${CYCLE_INTERVAL_MS / 1000} 秒`);
   console.log(`${'='.repeat(50)}\n`);
 
-  let cycleCount = 0;
-  let totalTradesProcessed = 0;
-  let totalTradesSuccess = 0;
+  // 使用对象存储统计数据，方便引用传递
+  const stats = {
+    cycleCount: 0,
+    totalTradesProcessed: 0,
+    totalTradesSuccess: 0
+  };
   let isRunning = true;
   let lastRedeemTime = 0;  // ← 新增：上次领取时间（时间戳）
 
 
   // 设置优雅关闭处理器
-  const shutdown = createShutdownHandler(cycleCount, totalTradesProcessed, totalTradesSuccess);
+  const shutdown = createShutdownHandler(stats);
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
   // 主循环
   while (isRunning) {
-    cycleCount++;
+    // 检查是否到达设定的关闭时间（北京时间）
+    const beijingTime = moment().utcOffset(8);
+    const currentHour = beijingTime.hour();
+    const currentMinute = beijingTime.minute();
+
+    if (currentHour === AUTO_CLOSE_HOUR && currentMinute >= AUTO_CLOSE_MINUTE) {
+      console.log(`\n⏰ 已到达北京时间 ${AUTO_CLOSE_HOUR}:${AUTO_CLOSE_MINUTE.toString().padStart(2, '0')}，程序自动关闭`);
+      await shutdown();
+      return;
+    }
+    // 检查是否达到买入上限且所有买入的仓位都已清仓
+    if (globalStats.totalBuyCount >= MAX_BUY_COUNT && globalStats.buyPositions.size > 0) {
+      try {
+        const myPositions = await httpGet(
+          `https://data-api.polymarket.com/positions?user=${FUNDER_ADDRESS}`
+        );
+
+        if (Array.isArray(myPositions)) {
+          const currentPositionIds = new Set(
+            myPositions
+              .filter(p => Number(p.size) > 0)
+              .map(p => p.conditionId)
+          );
+
+          // 检查买入的仓位是否还存在
+          let hasAnyBuyPosition = false;
+          for (const conditionId of globalStats.buyPositions) {
+            if (currentPositionIds.has(conditionId)) {
+              hasAnyBuyPosition = true;
+              break;
+            }
+          }
+
+          if (!hasAnyBuyPosition) {
+            console.log('\n🎯 已达到买入上限且所有买入仓位已清仓，程序自动关闭');
+            console.log(`   买入次数: ${globalStats.totalBuyCount}/${MAX_BUY_COUNT}`);
+            console.log(`   买入的市场数: ${globalStats.buyPositions.size}`);
+            console.log(`   当前持仓数: ${currentPositionIds.size}`);
+            await shutdown();
+            return;
+          }
+        }
+      } catch (error) {
+        console.error('检查持仓状态失败:', error.message);
+      }
+    }
+
+    stats.cycleCount++;
 
     try {
 
       // 执行单次循环
-      const result = await executeCycle(client, SMART_ADDRESSES, cycleCount);
+      const result = await executeCycle(client, SMART_ADDRESSES, stats.cycleCount);
+
+      // ===== Step A：判断“本轮是否安静”（新增）=====
+const isQuietThisCycle =
+  result.totalProcessed === 0 &&
+  result.totalSuccess === 0 &&
+  (!globalStats.pendingVerification ||
+    globalStats.pendingVerification.length === 0);
 
       // 更新总统计
-      totalTradesProcessed += result.totalProcessed;
-      totalTradesSuccess += result.totalSuccess;
+      stats.totalTradesProcessed += result.totalProcessed;
+      stats.totalTradesSuccess += result.totalSuccess;
 
-        // ===== 新增：按时间间隔领取奖金 =====
+      // ===== 新增：按时间间隔领取奖金 =====
+      const shouldPrintRedeemInfo =
+        result.totalProcessed > 0 ||
+        result.totalSuccess > 0 ||
+        (globalStats.pendingVerification &&
+          globalStats.pendingVerification.length > 0);
+
       const REDEEM_INTERVAL_HOURS = 24;  // 每24小时领取一次
       const currentTime = Date.now();
       const timeSinceLastRedeem = currentTime - lastRedeemTime;
       const redeemIntervalMs = REDEEM_INTERVAL_HOURS * 60 * 60 * 1000;
-      
+
       if (timeSinceLastRedeem >= redeemIntervalMs || lastRedeemTime === 0) {
         console.log(`\n🎁 距离上次领取已过 ${(timeSinceLastRedeem / 1000 / 60 / 60).toFixed(1)} 小时，执行领取奖金...`);
         await getAccountStats(client, claimClient);
         lastRedeemTime = currentTime;
       } else {
-        // 只获取余额，不领取奖金
-        const availableBalance = await getAvailableBalance(client);
-        console.log(`\n💰 当前可用余额: $${availableBalance.toFixed(2)}`);
-        
-        const nextRedeemIn = (redeemIntervalMs - timeSinceLastRedeem) / 1000 / 60;
-        console.log(`⏰ 下次领取时间: ${Math.ceil(nextRedeemIn)} 分钟后`);
+        if (shouldPrintRedeemInfo) {
+          const availableBalance = await getAvailableBalance(client);
+          console.log(`\n💰 当前可用余额: $${availableBalance.toFixed(2)}`);
+
+          const nextRedeemIn = (redeemIntervalMs - timeSinceLastRedeem) / 1000 / 60;
+          console.log(`⏰ 下次领取时间: ${Math.ceil(nextRedeemIn)} 分钟后`);
+        }
       }
+
       // ===== 修改结束 =====
 
       // 显示当前运行统计
-      console.log(`\n📈 当前运行统计:`);
-      console.log(`   循环次数: ${cycleCount}`);
-      console.log(`   累计处理: ${totalTradesProcessed}`);
-      console.log(`   累计成功: ${totalTradesSuccess}`);
-      if (totalTradesProcessed > 0) {
-        console.log(`   累计成功率: ${((totalTradesSuccess / totalTradesProcessed) * 100).toFixed(1)}%`);
+
+const shouldPrintRuntimeStats =
+  result.totalProcessed > 0 ||
+  result.totalSuccess > 0;
+
+
+
+      if (shouldPrintRuntimeStats) {
+        console.log(`\n📈 当前运行统计:`);
+        console.log(`   循环次数: ${stats.cycleCount}`);
+        console.log(`   累计处理: ${stats.totalTradesProcessed}`);
+        console.log(`   累计成功: ${stats.totalTradesSuccess}`);
+        console.log(`   累计买入: ${globalStats.totalBuyCount}/${MAX_BUY_COUNT} 次`);
+if (result.totalProcessed > 0) {
+  const rate =
+    (result.totalSuccess / result.totalProcessed) * 100;
+  console.log(`成功率: ${rate.toFixed(1)}%`);
+}
+
       }
 
-      // 计算等待时间并执行下一次循环
+      // ===== Step 2：低频心跳日志 =====
+const shouldHeartbeat =
+  stats.cycleCount % HEARTBEAT_INTERVAL === 0;
+
+
+      if (shouldHeartbeat) {
+        console.log(
+          `💤 心跳：已运行 ${stats.cycleCount} 轮 | ` +
+          `成功 ${stats.totalTradesSuccess} | ` +
+          `BUY ${globalStats.totalBuyCount}/${MAX_BUY_COUNT}`
+        );
+      }
+
+      // ===== 等待下一轮 =====
       const remainingTime = CYCLE_INTERVAL_MS - result.elapsedTime;
-      if (remainingTime > 0) {
+
+      if (shouldPrintRuntimeStats && remainingTime > 0) {
         console.log(`\n⏳ 等待 ${Math.ceil(remainingTime / 1000)} 秒后开始下一次扫描...`);
         console.log(`📅 下次扫描时间: ${moment().add(remainingTime, 'ms').format('HH:mm:ss')}`);
         console.log(`${'-'.repeat(50)}`);
+      }
+
+      if (remainingTime > 0) {
         await delay(remainingTime);
       } else {
         console.log('\n⚠️ 上次扫描耗时过长，立即开始下一次扫描...');
       }
+
     } catch (error) {
-      console.error(`❌ 第 ${cycleCount} 次循环执行失败:`, error.message);
+      console.error(`❌ 第 ${stats.cycleCount} 次循环执行失败:`, error.message);
       console.log(`⏳ 等待 ${CYCLE_INTERVAL_MS / 2000} 秒后重试...`);
       await delay(CYCLE_INTERVAL_MS / 2);
     }
@@ -1106,4 +1647,6 @@ mainLoop().catch(error => {
   console.error("错误堆栈:", error.stack);
   process.exit(1);
 });
+
+
 
