@@ -25,6 +25,10 @@
     └──────────────────────┘
 ```
 
+### 详细架构图
+
+[查看详细架构图](https://github.com/Leo2021zzz/testgit/blob/main/polymarket-bot-architecture.html)
+
 ### 核心模块
 
 1. **交易监控** - 监控聪明钱包的最近交易

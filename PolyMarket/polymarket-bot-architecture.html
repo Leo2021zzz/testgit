@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket 跟单机器人 - 逻辑架构图</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        
+        h1 {
+            text-align: center;
+            color: #2d3748;
+            margin-bottom: 10px;
+            font-size: 32px;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: #718096;
+            margin-bottom: 40px;
+            font-size: 16px;
+        }
+        
+        .architecture {
+            display: flex;
+            flex-direction: column;
+            gap: 30px;
+        }
+        
+        .layer {
+            background: #f7fafc;
+            border-radius: 12px;
+            padding: 25px;
+            border: 2px solid #e2e8f0;
+        }
+        
+        .layer-title {
+            font-size: 20px;
+            font-weight: bold;
+            color: #2d3748;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #4299e1;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .layer-icon {
+            font-size: 24px;
+        }
+        
+        .modules {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+        }
+        
+        .module {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            border-left: 4px solid #4299e1;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            transition: all 0.3s ease;
+        }
+        
+        .module:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.15);
+        }
+        
+        .module-title {
+            font-size: 16px;
+            font-weight: bold;
+            color: #2d3748;
+            margin-bottom: 10px;
+        }
+        
+        .module-desc {
+            font-size: 14px;
+            color: #718096;
+            line-height: 1.6;
+            margin-bottom: 12px;
+        }
+        
+        .module-features {
+            list-style: none;
+            font-size: 13px;
+            color: #4a5568;
+        }
+        
+        .module-features li {
+            padding: 4px 0;
+            padding-left: 18px;
+            position: relative;
+        }
+        
+        .module-features li:before {
+            content: "→";
+            position: absolute;
+            left: 0;
+            color: #4299e1;
+            font-weight: bold;
+        }
+        
+        .flow-diagram {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        
+        .flow-step {
+            display: flex;
+            align-items: center;
+            margin: 15px 0;
+            padding: 15px;
+            background: #f7fafc;
+            border-radius: 8px;
+            border-left: 4px solid #48bb78;
+        }
+        
+        .flow-number {
+            background: #48bb78;
+            color: white;
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            margin-right: 15px;
+            flex-shrink: 0;
+        }
+        
+        .flow-content {
+            flex: 1;
+        }
+        
+        .flow-title {
+            font-weight: bold;
+            color: #2d3748;
+            margin-bottom: 4px;
+        }
+        
+        .flow-desc {
+            font-size: 13px;
+            color: #718096;
+        }
+        
+        .arrow-down {
+            text-align: center;
+            color: #48bb78;
+            font-size: 24px;
+            margin: 10px 0;
+        }
+        
+        .config-section {
+            background: #fff5f5;
+            border: 2px solid #fc8181;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        
+        .config-title {
+            font-weight: bold;
+            color: #c53030;
+            margin-bottom: 12px;
+            font-size: 16px;
+        }
+        
+        .config-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px;
+        }
+        
+        .config-item {
+            background: white;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 13px;
+            color: #2d3748;
+        }
+        
+        .config-key {
+            color: #c53030;
+            font-weight: bold;
+        }
+        
+        .highlight-box {
+            background: #fefcbf;
+            border: 2px solid #f6e05e;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        
+        .highlight-title {
+            font-weight: bold;
+            color: #744210;
+            margin-bottom: 8px;
+        }
+        
+        .highlight-text {
+            font-size: 14px;
+            color: #744210;
+            line-height: 1.6;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 Polymarket 跟单机器人</h1>
+        <div class="subtitle">自动跟随聪明钱包交易的智能机器人系统</div>
+        
+        <!-- 系统架构 -->
+        <div class="architecture">
+            
+            <!-- 第一层：初始化层 -->
+            <div class="layer">
+                <div class="layer-title">
+                    <span class="layer-icon">🔧</span>
+                    1. 初始化层 (Initialization Layer)
+                </div>
+                <div class="modules">
+                    <div class="module">
+                        <div class="module-title">环境变量验证</div>
+                        <div class="module-desc">验证必需的配置参数</div>
+                        <ul class="module-features">
+                            <li>私钥 (SECRETKEY)</li>
+                            <li>钱包地址 (FUNDER_ADDRESS)</li>
+                            <li>聪明钱包列表 (SMART_WALLET)</li>
+                            <li>API凭证 (POLY_BUILDER_*)</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">客户端初始化</div>
+                        <div class="module-desc">连接区块链和交易所</div>
+                        <ul class="module-features">
+                            <li>创建 Polygon RPC 连接</li>
+                            <li>初始化 CLOB 交易客户端</li>
+                            <li>初始化 Relayer 领取客户端</li>
+                            <li>生成 API 密钥</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">全局状态管理</div>
+                        <div class="module-desc">维护运行时统计数据</div>
+                        <ul class="module-features">
+                            <li>成功跟单记录 (walletTrades)</li>
+                            <li>失败跟单记录 (walletFailedTrades)</li>
+                            <li>买入计数器 (totalBuyCount)</li>
+                            <li>持仓追踪 (buyPositions)</li>
+                            <li>待验证队列 (pendingVerification)</li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <div class="config-section">
+                    <div class="config-title">⚙️ 核心配置参数</div>
+                    <div class="config-grid">
+                        <div class="config-item"><span class="config-key">FOLLOW_VALUE:</span> 跟单比例</div>
+                        <div class="config-item"><span class="config-key">MIN_ORDER_AMOUNT:</span> 最小订单金额</div>
+                        <div class="config-item"><span class="config-key">MAX_ORDER_AMOUNT:</span> 最大订单金额</div>
+                        <div class="config-item"><span class="config-key">MIN_FOLLOW_AMOUNT:</span> 聪明钱包下单金额小于该值，则不跟单</div>
+                        <div class="config-item"><span class="config-key">MAX_BUY_COUNT:</span> 最大买入次数</div>
+                        <div class="config-item"><span class="config-key">CYCLE_INTERVAL_MS:</span> 循环间隔</div>
+                        <div class="config-item"><span class="config-key">AUTO_CLOSE_HOUR:</span> 自动关闭时间</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 第二层：主循环层 -->
+            <div class="layer">
+                <div class="layer-title">
+                    <span class="layer-icon">🔄</span>
+                    2. 主循环层 (Main Loop Layer)
+                </div>
+                
+                <div class="flow-diagram">
+                    <div class="flow-step">
+                        <div class="flow-number">1</div>
+                        <div class="flow-content">
+                            <div class="flow-title">循环启动检查</div>
+                            <div class="flow-desc">检查是否到达关闭时间、是否达到买入上限且已清仓</div>
+                        </div>
+                    </div>
+                    
+                    <div class="arrow-down">↓</div>
+                    
+                    <div class="flow-step">
+                        <div class="flow-number">2</div>
+                        <div class="flow-content">
+                            <div class="flow-title">扫描聪明钱包</div>
+                            <div class="flow-desc">并发扫描所有配置的聪明钱包，获取最近2分钟的交易记录</div>
+                        </div>
+                    </div>
+                    
+                    <div class="arrow-down">↓</div>
+                    
+                    <div class="flow-step">
+                        <div class="flow-number">3</div>
+                        <div class="flow-content">
+                            <div class="flow-title">验证待确认订单</div>
+                            <div class="flow-desc">检查上一轮未确定的订单状态（最多保留10轮）</div>
+                        </div>
+                    </div>
+                    
+                    <div class="arrow-down">↓</div>
+                    
+                    <div class="flow-step">
+                        <div class="flow-number">4</div>
+                        <div class="flow-content">
+                            <div class="flow-title">处理交易</div>
+                            <div class="flow-desc">对每笔交易执行跟单逻辑（详见交易处理层）</div>
+                        </div>
+                    </div>
+                    
+                    <div class="arrow-down">↓</div>
+                    
+                    <div class="flow-step">
+                        <div class="flow-number">5</div>
+                        <div class="flow-content">
+                            <div class="flow-title">定时领取奖金</div>
+                            <div class="flow-desc">每24小时自动领取已结算市场的奖金</div>
+                        </div>
+                    </div>
+                    
+                    <div class="arrow-down">↓</div>
+                    
+                    <div class="flow-step">
+                        <div class="flow-number">6</div>
+                        <div class="flow-content">
+                            <div class="flow-title">显示统计 & 等待</div>
+                            <div class="flow-desc">显示本轮统计数据，等待下一轮循环（默认2分钟）</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="highlight-box">
+                    <div class="highlight-title">💡 心跳机制</div>
+                    <div class="highlight-text">每10次循环输出一次心跳日志，避免无交易时的日志爆炸</div>
+                </div>
+            </div>
+            
+            <!-- 第三层：交易处理层 -->
+            <div class="layer">
+                <div class="layer-title">
+                    <span class="layer-icon">💰</span>
+                    3. 交易处理层 (Transaction Processing Layer)
+                </div>
+                <div class="modules">
+                    <div class="module">
+                        <div class="module-title">交易筛选</div>
+                        <div class="module-desc">过滤无效和重复交易</div>
+                        <ul class="module-features">
+                            <li>跳过 REDEEM 类型</li>
+                            <li>检查是否已有持仓</li>
+                            <li>验证市场信息</li>
+                            <li>检查聪明钱包最小金额</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">买入前置检查</div>
+                        <div class="module-desc">在买入前执行风控检查</div>
+                        <ul class="module-features">
+                            <li>检查聪明钱包是否套利（持有≥2个方向）</li>
+                            <li>检查是否持有反方向</li>
+                            <li>验证可用余额（预留3%安全边距）</li>
+                            <li>检查是否达到买入上限</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">买入执行</div>
+                        <div class="module-desc">执行市价买入订单</div>
+                        <ul class="module-features">
+                            <li>计算跟单金额（按比例或随机）</li>
+                            <li>创建 FOK 市价单</li>
+                            <li>等待7秒确认</li>
+                            <li>通过 OrderID 验证状态</li>
+                            <li>更新持仓和买入计数</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">卖出执行</div>
+                        <div class="module-desc">三种卖出场景</div>
+                        <ul class="module-features">
+                            <li><strong>跟随卖出:</strong> 检查持仓后跟随</li>
+                            <li><strong>套利清仓:</strong> 聪明钱包套利时清仓</li>
+                            <li><strong>反向清仓:</strong> 持有反方向时卖出</li>
+                            <li>5次重试机制</li>
+                            <li>只要1次成功即算成功</li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <div class="highlight-box">
+                    <div class="highlight-title">🎯 跟单决策流程</div>
+                    <div class="highlight-text">
+                        <strong>BUY:</strong> 检查持仓 → 检查套利 → 检查反向 → 执行买入 → 验证状态<br>
+                        <strong>SELL:</strong> 检查持仓 → 5次重试卖出 → 验证余额变化
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 第四层：风控层 -->
+            <div class="layer">
+                <div class="layer-title">
+                    <span class="layer-icon">🛡️</span>
+                    4. 风控层 (Risk Management Layer)
+                </div>
+                <div class="modules">
+                    <div class="module">
+                        <div class="module-title">套利检测</div>
+                        <div class="module-desc">防止跟随套利交易</div>
+                        <ul class="module-features">
+                            <li>检查聪明钱包是否持有≥2个方向</li>
+                            <li>如有持仓则立即清仓</li>
+                            <li>无持仓则跳过不跟</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">反向持仓保护</div>
+                        <div class="module-desc">防止同时持有多个方向</div>
+                        <ul class="module-features">
+                            <li>检查是否持有反方向资产</li>
+                            <li>如持有则先卖出原持仓</li>
+                            <li>清仓后再跟随新交易</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">余额管理</div>
+                        <div class="module-desc">确保资金安全</div>
+                        <ul class="module-features">
+                            <li>买入预留3%安全边距</li>
+                            <li>最小可用余额检查</li>
+                            <li>超过余额时自动调整金额</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">买入次数限制</div>
+                        <div class="module-desc">控制风险敞口</div>
+                        <ul class="module-features">
+                            <li>达到 MAX_BUY_COUNT 后只能卖出</li>
+                            <li>所有买入仓位清仓后自动关闭</li>
+                            <li>防止过度交易</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 第五层：统计层 -->
+            <div class="layer">
+                <div class="layer-title">
+                    <span class="layer-icon">📊</span>
+                    5. 统计与监控层 (Statistics & Monitoring Layer)
+                </div>
+                <div class="modules">
+                    <div class="module">
+                        <div class="module-title">实时统计</div>
+                        <div class="module-desc">记录所有交易数据</div>
+                        <ul class="module-features">
+                            <li>成功跟单记录（金额、时间、市场）</li>
+                            <li>失败跟单记录（原因、类型）</li>
+                            <li>按钱包分组统计</li>
+                            <li>成功率计算</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">状态追踪</div>
+                        <div class="module-desc">追踪系统运行状态</div>
+                        <ul class="module-features">
+                            <li>循环次数计数</li>
+                            <li>累计处理交易数</li>
+                            <li>累计成功跟单数</li>
+                            <li>买入次数追踪</li>
+                            <li>持仓集合维护</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">待验证队列</div>
+                        <div class="module-desc">管理未确定订单</div>
+                        <ul class="module-features">
+                            <li>存储未确认订单</li>
+                            <li>每轮检查状态</li>
+                            <li>超过10轮判定失败</li>
+                            <li>MATCHED 后更新为成功</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">日志输出</div>
+                        <div class="module-desc">友好的日志系统</div>
+                        <ul class="module-features">
+                            <li>简化错误信息显示</li>
+                            <li>按钱包统计跟单详情</li>
+                            <li>低频心跳日志</li>
+                            <li>彩色 emoji 标记</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 第六层：领取层 -->
+            <div class="layer">
+                <div class="layer-title">
+                    <span class="layer-icon">🎁</span>
+                    6. 奖金领取层 (Redemption Layer)
+                </div>
+                <div class="modules">
+                    <div class="module">
+                        <div class="module-title">持仓查询</div>
+                        <div class="module-desc">获取可领取的市场</div>
+                        <ul class="module-features">
+                            <li>查询所有持仓</li>
+                            <li>筛选已结算市场</li>
+                            <li>区分标准市场和负风险市场</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">领取执行</div>
+                        <div class="module-desc">批量领取奖金</div>
+                        <ul class="module-features">
+                            <li>构建 redeemPositions 交易</li>
+                            <li>通过 Relayer 提交</li>
+                            <li>支持标准 CTF 市场</li>
+                            <li>支持 NegRisk 市场</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">定时领取</div>
+                        <div class="module-desc">避免频繁调用</div>
+                        <ul class="module-features">
+                            <li>24小时间隔领取</li>
+                            <li>避免 API 限额</li>
+                            <li>减少日志输出</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 第七层：关闭层 -->
+            <div class="layer">
+                <div class="layer-title">
+                    <span class="layer-icon">🛑</span>
+                    7. 优雅关闭层 (Graceful Shutdown Layer)
+                </div>
+                <div class="modules">
+                    <div class="module">
+                        <div class="module-title">关闭触发条件</div>
+                        <div class="module-desc">三种关闭方式</div>
+                        <ul class="module-features">
+                            <li><strong>手动关闭:</strong> SIGINT/SIGTERM 信号</li>
+                            <li><strong>定时关闭:</strong> 到达设定时间（北京时间）</li>
+                            <li><strong>自动关闭:</strong> 达到买入上限且已清仓</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="module">
+                        <div class="module-title">关闭流程</div>
+                        <div class="module-desc">安全退出程序</div>
+                        <ul class="module-features">
+                            <li>显示总运行统计</li>
+                            <li>输出成功率</li>
+                            <li>等待当前操作完成</li>
+                            <li>清理资源</li>
+                            <li>退出进程 (exit 0)</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            
+        </div>
+        
+        <!-- 数据流图 -->
+        <div class="layer" style="margin-top: 40px;">
+            <div class="layer-title">
+                <span class="layer-icon">🔀</span>
+                核心数据流
+            </div>
+            <div class="flow-diagram">
+                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; text-align: center;">
+                    <div style="background: #e6fffa; padding: 15px; border-radius: 8px; border: 2px solid #81e6d9;">
+                        <div style="font-weight: bold; color: #234e52; margin-bottom: 8px;">📥 输入</div>
+                        <div style="font-size: 13px; color: #2c7a7b;">
+                            • 聪明钱包地址<br>
+                            • 环境变量配置<br>
+                            • API 凭证
+                        </div>
+                    </div>
+                    
+                    <div style="background: #fef5e7; padding: 15px; border-radius: 8px; border: 2px solid #f6ad55;">
+                        <div style="font-weight: bold; color: #7c2d12; margin-bottom: 8px;">⚙️ 处理</div>
+                        <div style="font-size: 13px; color: #9c4221;">
+                            • 扫描交易<br>
+                            • 风控检查<br>
+                            • 执行跟单<br>
+                            • 验证结果
+                        </div>
+                    </div>
+                    
+                    <div style="background: #fef2f2; padding: 15px; border-radius: 8px; border: 2px solid #fc8181;">
+                        <div style="font-weight: bold; color: #742a2a; margin-bottom: 8px;">📤 输出</div>
+                        <div style="font-size: 13px; color: #9b2c2c;">
+                            • 交易记录<br>
+                            • 统计数据<br>
+                            • 日志信息
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+    </div>
+</body>
+</html>
