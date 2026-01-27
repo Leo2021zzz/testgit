@@ -27,7 +27,7 @@
 
 ### 详细架构图
 
-[查看详细架构图](https://github.com/Leo2021zzz/testgit/blob/main/polymarket-bot-architecture.html)
+[查看完整架构图](https://leo2021zzz.github.io/testgit/PolyMarket/polymarket-bot-architecture.html)
 
 ### 核心模块
 
