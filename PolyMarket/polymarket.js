@@ -25,6 +25,7 @@
 // update: 启用心跳日志。 
 // fix  领取时部分领取失败  、二元市场 正常，多元市场结果 未知
 // fix: 跟随卖出时，会先检查是否有该持仓。 没有持仓直接跳过，不在用空订单去访问 api ；优化下单失败的报错提示；买入2次并清仓后，程序现在会正确关闭； 修复买入时却提示余额不足的小概率事件，预留总资金的 3% 作为安全边际
+// fix :多元修复领取错误
 
 //获取传入的参数
 const args = process.argv.slice(2); // 跳过前两个固定参数
@@ -1036,9 +1037,9 @@ function createRedeemTransaction(position) {
     console.error("负风险市场赎回");
     let amounts
     if (position.outcomeIndex == 0) {
-      amounts = [ethers.parseUnits(position.size, 6), 0];
+      amounts = [ethers.utils.parseUnits(position.size.toString(),6), 0];
     } else {
-      amounts = [0, ethers.parseUnits(position.size, 6)];
+      amounts = [0, ethers.utils.parseUnits(position.size.toString(),6)];
     }
     return {
       to: NEG_RISK_ADAPTER,
@@ -1647,6 +1648,10 @@ mainLoop().catch(error => {
   console.error("错误堆栈:", error.stack);
   process.exit(1);
 });
+
+
+
+
 
 
 
