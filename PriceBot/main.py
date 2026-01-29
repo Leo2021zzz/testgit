@@ -28,7 +28,7 @@ password = ''
 
 # 远程SOCKS5代理设置
 proxy_address = ''
-proxy_port =   
+proxy_port =  1080
 proxy_username = ''
 proxy_password = ''
 
